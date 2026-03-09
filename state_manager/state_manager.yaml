@@ -1,0 +1,5 @@
+state_manager:
+  # Number of recent snapshots kept per object.
+  # Increase -> longer history for debugging and analysis, but more memory.
+  # Decrease -> smaller memory footprint, but less temporal context.
+  history_length: 300

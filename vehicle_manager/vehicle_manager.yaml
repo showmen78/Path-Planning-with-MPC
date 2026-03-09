@@ -1,0 +1,43 @@
+vehicle_manager:
+  # Fallback geometry defaults used when an individual scenario vehicle entry
+  # omits these fields.
+  defaults:
+    # Wheelbase [m] used by the kinematic bicycle model.
+    # Increase -> wider turning radius and slower yaw response.
+    # Decrease -> tighter turning and more responsive yaw.
+    wheelbase_m: 2.7
+
+    # Vehicle body length [m].
+    # Increase -> larger rendered footprint and larger obstacle safety region.
+    # Decrease -> smaller footprint and tighter obstacle inflation.
+    length_m: 4.5
+
+    # Vehicle body width [m].
+    # Increase -> wider rendered footprint and larger lateral safety region.
+    # Decrease -> narrower footprint and tighter lateral clearance.
+    width_m: 2.7
+
+  # Per-type defaults keep scenario YAMLs short while preserving different
+  # geometry/appearance for ego, vehicles, and VRUs.
+  type_defaults:
+    ego:
+      color_rgb: [30, 140, 240]
+    obstacle:
+      color_rgb: [215, 85, 85]
+    emergency_vehicle:
+      color_rgb: [220, 60, 60]
+    vru:
+      color_rgb: [245, 205, 70]
+      length_m: 1.0
+      width_m: 0.7
+      wheelbase_m: 0.8
+
+  # Semantic object classes available to scenarios. The current runtime safety
+  # cost is shape-based and does not yet apply class-specific weights.
+  object_classes:
+    surrounding_vehicle:
+      description: "Regular traffic vehicle (static or dynamic)."
+    emergency_vehicle:
+      description: "Emergency vehicle placeholder for future priority weighting."
+    vru:
+      description: "Vulnerable road user placeholder for future priority weighting."

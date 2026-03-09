@@ -1,0 +1,19 @@
+# Core numeric stack used by the MPC, tracker, and super-ellipsoid reference script.
+numpy
+scipy
+
+# QP solver used by the live MPC planner.
+osqp
+
+# YAML configuration loading.
+pyyaml
+
+# Runtime visualization and vehicle/road rendering.
+pygame
+
+# End-of-run plotting and the standalone super_ellipsoid.py analysis script.
+matplotlib
+
+# Optional:
+# If you later install an OSQP CUDA backend manually, keep it outside this file
+# unless you want requirements installation to depend on a specific CUDA stack.

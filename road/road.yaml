@@ -1,0 +1,51 @@
+road:
+  # Base road geometry type used when a scenario does not override it.
+  type: straight
+
+  # Longitudinal lane direction convention used by waypoint generation.
+  direction: positive_x
+
+  # Number of lanes in the default road template.
+  # Increase -> wider road with more candidate lanes.
+  # Decrease -> narrower road and fewer lane options.
+  lane_count: 4
+
+  # Lane width [m].
+  # Increase -> more lateral spacing between lane centers.
+  # Decrease -> tighter lanes and smaller lateral lane changes.
+  lane_width_m: 3.66
+
+  # Vertical world coordinate [m] of the road center line.
+  # Increase/decrease -> shifts the whole road up/down in world coordinates.
+  center_y_m: 0.0
+
+  # Extra world margin [m] added left/right when generating or drawing the road.
+  # Increase -> more road visible/generated beyond the active area.
+  # Decrease -> tighter crop around the active region.
+  visible_x_margin_m: 20.0
+
+  # Extra world margin [m] added above/below the road for rendering context.
+  # Increase -> more vertical scene padding.
+  # Decrease -> tighter vertical framing.
+  visible_y_margin_m: 20.0
+
+  # Spacing [m] between generated lane-center waypoints.
+  # Increase -> fewer, coarser waypoints.
+  # Decrease -> denser waypoints and smoother geometry, but more data.
+  waypoint_spacing_m: 3.0
+
+  # Waypoint-visualization switches for pygame rendering.
+  show_lane_waypoints: true
+  waypoint_color_rgb: [70, 190, 90]
+  waypoint_radius_px: 2
+
+  # Draw every Nth waypoint only.
+  # Increase -> lighter rendering load and less clutter.
+  # Decrease -> denser waypoint visualization.
+  waypoint_draw_stride: 2
+
+  # Road-render colors.
+  boundary_color_rgb: [245, 245, 245]
+  lane_line_color_rgb: [230, 230, 230]
+  center_line_color_rgb: [230, 210, 70]
+  road_color_rgb: [56, 56, 56]

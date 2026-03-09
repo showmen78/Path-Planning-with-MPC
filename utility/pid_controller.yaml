@@ -1,0 +1,149 @@
+pid_controller:
+  tracking:
+    lookahead_steps: 1 #1
+    max_index_advance_per_step: 4
+    waypoint_reached_distance_m: 0.60
+    heading_reached_threshold_rad: 0.8  #0.80
+    along_track_pass_threshold_m: 0.25
+    heading_los_blend: 0.35 #0.35 #0.1
+    speed_preview_limit_mps: 0.0
+    steering_rate_limit_rad_per_s: 0.3 #2
+    lateral_cross_track_gain: 0.3 #0.8
+
+  longitudinal:
+    k_p: 2
+    k_i: 0.05
+    k_d: 0.15
+    integral_limit: 10.0
+    output_limit: 0.0
+
+  lateral_heading:
+    k_p: 0.02
+    k_i: 0.05
+    k_d: 0.50
+    integral_limit: 2.0
+    output_limit: 0.0
+
+  lateral_cross_track:
+    k_p: 0.65 #0.65
+    k_i: 0.00
+    k_d: 0.2
+    integral_limit: 4.0
+    output_limit: 0.0
+
+note:
+  pid_controller_overview: |
+    This PID tracker converts MPC state trajectory points [x, y, v, psi] into
+    executable low-level controls [acceleration, steering]. The controller is
+    split into one longitudinal PID (speed) and two lateral PID terms
+    (heading error and cross-track error). Final steering is the heading PID
+    output plus a weighted cross-track correction.
+
+  tracking:
+    lookahead_steps: |
+      Number of trajectory points ahead of the current plan cursor used as the
+      active target. Higher values make the controller look farther ahead and
+      usually smooth steering, but can cut corners and increase tracking error
+      in tight maneuvers. Lower values improve local accuracy but can make
+      control more reactive and oscillatory.
+    max_index_advance_per_step: |
+      Maximum number of waypoint indices the tracker can skip in one simulation
+      step while advancing the target index. This prevents very fast "jumping"
+      through trajectory points when ego motion is large. Larger values reduce
+      the chance of getting stuck on old points but can skip important path
+      detail; smaller values improve fidelity but may lag behind fast motion.
+    waypoint_reached_distance_m: |
+      Euclidean distance threshold used to mark the current target waypoint as
+      reached. Increasing it advances waypoints earlier (smoother, less precise
+      tracking). Decreasing it forces tighter convergence to each point
+      (higher precision, but can increase oscillation near waypoints).
+    heading_reached_threshold_rad: |
+      Heading-error threshold used with waypoint distance to decide whether a
+      waypoint is considered reached. Larger values tolerate misalignment and
+      advance faster; smaller values enforce better orientation matching but can
+      delay advancement and create steering chatter.
+    along_track_pass_threshold_m: |
+      Secondary advancement condition based on projected progress along the
+      target direction. If ego has moved sufficiently past the waypoint in the
+      along-track direction, the cursor can advance even without strict
+      distance+heading satisfaction. Larger values are conservative; smaller
+      values advance earlier.
+    heading_los_blend: |
+      Blend factor between path heading and line-of-sight (LOS) heading to the
+      target. 0.0 means use path heading only; 1.0 means use LOS heading only.
+      Higher values improve convergence when laterally off-track but can induce
+      sharper steering; lower values are smoother but may recover from large
+      offsets more slowly.
+    speed_preview_limit_mps: |
+      Optional cap on target speed used by the longitudinal PID. If > 0, the
+      MPC target speed is clamped to this value before speed error is computed.
+      Useful for conservative tracking tests. 0.0 disables this extra cap.
+    steering_rate_limit_rad_per_s: |
+      Rate limiter applied to commanded steering between consecutive control
+      updates. It limits |delta_cmd(k)-delta_cmd(k-1)|/dt. Lower values strongly
+      smooth steering and reduce jitter, but can under-steer in aggressive
+      maneuvers. Higher values increase responsiveness but can amplify
+      oscillations.
+    lateral_cross_track_gain: |
+      Gain applied to the cross-track PID contribution before adding it to the
+      heading PID output. Higher values prioritize lateral position correction;
+      if too high, it can cause zig-zag behavior. Lower values prioritize
+      heading alignment and generally smoother steering, but may leave larger
+      lateral error.
+
+  longitudinal:
+    k_p: |
+      Proportional gain for speed error. Increasing k_p improves response speed
+      to speed setpoint changes, but too high can cause overshoot and throttle/
+      brake oscillation.
+    k_i: |
+      Integral gain for accumulated speed error. Helps remove steady-state bias
+      (e.g., persistent under-speed). Too high can cause windup and slower
+      settling after transients.
+    k_d: |
+      Derivative gain for speed error change rate. Adds damping and can reduce
+      overshoot. Too high can amplify noise and create jerky acceleration.
+    integral_limit: |
+      Anti-windup clamp on the integral state of the longitudinal PID.
+      Increasing allows stronger bias correction but raises windup risk.
+      Decreasing improves stability but may leave residual steady-state error.
+    output_limit: |
+      Symmetric clamp on raw longitudinal PID output. If > 0, the output is
+      clipped to [-output_limit, output_limit] before actuator limits are
+      applied. 0.0 disables this PID-output clamp (vehicle limits still apply).
+
+  lateral_heading:
+    k_p: |
+      Proportional gain on heading error. Higher values turn more aggressively
+      toward heading reference; too high causes oscillation around the path
+      direction.
+    k_i: |
+      Integral gain on heading error. Can correct persistent bias in heading
+      alignment, but often kept near zero to avoid slow oscillatory drift.
+    k_d: |
+      Derivative gain on heading error rate. Provides damping and helps reduce
+      overshoot in steering response. Too high may react strongly to noise.
+    integral_limit: |
+      Anti-windup clamp for heading PID integral state. Lower values are safer;
+      higher values allow stronger long-term correction with higher windup risk.
+    output_limit: |
+      Optional symmetric clamp on heading PID term before combination with
+      cross-track term. 0.0 disables the clamp.
+
+  lateral_cross_track:
+    k_p: |
+      Proportional gain on lateral cross-track error (meters). Higher values
+      correct lateral offset faster but can induce side-to-side oscillation if
+      combined with high heading gains.
+    k_i: |
+      Integral gain on cross-track error. Helps remove persistent lateral bias
+      (e.g., model mismatch). Usually small or zero for stability.
+    k_d: |
+      Derivative gain on cross-track error. Adds damping to lateral correction
+      and can reduce overshoot during lane return maneuvers.
+    integral_limit: |
+      Anti-windup clamp for cross-track integral state. Controls how much
+      long-term lateral bias correction is allowed.
+    output_limit: |
+      Optional symmetric clamp on cross-track PID output. 0.0 disables the
+      clamp and leaves only global steering limits/rate limits to bound output.

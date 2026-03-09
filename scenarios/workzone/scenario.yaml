@@ -1,0 +1,122 @@
+simulation:
+  dt_s: 0.05
+  start_delay_s: 0
+  target_fps: 60
+  visualization_horizon_s: 3.0
+  replan_buffer_steps: 50
+  plot_width_scale: 0.6
+  plot_height_scale: 2.4
+  plot_trajectory_height_scale: 1.0
+  background_color_rgb: [168, 192, 136]
+
+window:
+  width_px: 2500
+  height_px: 1200
+  title: "MPC Custom - Workzone Scenario"
+  pixels_per_meter: 15.0
+
+road:
+  lane_count: 4
+  lane_width_m: 3.66
+  center_y_m: 0.0
+  camera_center_x_m: 0.0
+  visible_x_margin_m: 10.0
+  waypoint_spacing_m: 1.0
+  show_lane_waypoints: true
+  waypoint_color_rgb: [70, 190, 90]
+  waypoint_radius_px: 2
+  waypoint_draw_stride: 1
+  boundary_color_rgb: [245, 245, 245]
+  lane_line_color_rgb: [230, 230, 230]
+  road_color_rgb: [56, 56, 56]
+  type: curved
+  curve:
+    # This curve places the requested ego and obstacle coordinates close to the
+    # right-most lane centerline.
+    amplitude_m: 3.0
+    wavelength_m: 160.0
+    x_reference_m: -80.0
+    phase_rad: 0.0
+    draw_step_m: 0.5
+
+# Base final destination before the workzone lane-change trigger fires.
+destination: [120.0, -2.49, 0.0, 0.0]
+
+behavior_planner:
+  enabled: true
+  # Trigger the workzone lane change once ego reaches this x-position.
+  trigger_x_m: -20.0
+  trigger_when_ego_x_ge: true
+  # Use the lane containing the waypoint closest to this point as the post-
+  # trigger route lane. On the current curve this maps to the adjacent lane and
+  # yields a temporary destination near [9.73, -2.93].
+  lane_change_anchor_xy: [9.73, -2.93]
+
+mpc:
+  local_goal:
+    v_ref_mps: 20.0
+    lock_to_final_distance_m: 2.0
+  constraints:
+    min_velocity_mps: 0.0
+    max_velocity_mps: 10.0
+    min_acceleration_mps2: -4.0
+    max_acceleration_mps2: 2.5
+    max_jerk_mps3: 10.0
+    min_steer_rad: -0.6
+    max_steer_rad: 0.6
+    min_steer_rate_rps: -0.4
+    max_steer_rate_rps: 0.4
+    enforce_terminal_velocity_constraint: false
+    terminal_velocity_mps: 0.0
+
+tracker:
+  polynomial_degree: 3
+  fit_window_s: 4.0
+  max_history_points: 200
+  min_points_for_polyfit: 3
+
+vehicles:
+  - vehicle_id: "ego"
+    type: "ego"
+    initial_state: [-47, -2.47, 0.0, 0.0317]
+    wheelbase_m: 2.0
+    length_m: 4.5
+    width_m: 2.0
+    color_rgb: [30, 140, 240]
+
+  - vehicle_id: "obs_static_workzone"
+    type: "surrounding_vehicle"
+    initial_state: [18.4, -7.40, 0.0, -0.0881]
+    motion_mode: "static"
+    wheelbase_m: 2.0
+    length_m: 4.5
+    width_m: 2.0
+    color_rgb: [215, 85, 85]
+
+  - vehicle_id: "cav_waypoint_follow"
+    type: "surrounding_vehicle"
+    # Spawn the CAV on the lane center with the local road heading so it can
+    # smoothly follow the next waypoint on the curved road.
+    initial_state: [-6.0, -1.13, 0.0, -0.1141]
+    motion_mode: "lane_waypoint_follow"
+    desired_speed_mps: 10.0
+    steer_kp: 1.8
+    speed_kp: 1.5
+    wheelbase_m: 2.0
+    length_m: 4.5
+    width_m: 2.0
+    color_rgb: [235, 170, 80]
+
+  - vehicle_id: "cav_waypoint_follow2"
+    type: "surrounding_vehicle"
+    # Spawn the CAV on the lane center with the local road heading so it can
+    # smoothly follow the next waypoint on the curved road.
+    initial_state: [-50.0, 1.13, 0.0, -0.1141]
+    motion_mode: "lane_waypoint_follow"
+    desired_speed_mps: 4.0
+    steer_kp: 1.8
+    speed_kp: 1.5
+    wheelbase_m: 2.0
+    length_m: 4.5
+    width_m: 2.0
+    color_rgb: [235, 170, 80]
