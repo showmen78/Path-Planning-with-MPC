@@ -41,6 +41,7 @@ Run a scenario from the project root:
 python main.py scenario4
 python main.py VRU
 python main.py red_light_violation_warning
+python main.py red_light_violation_warning_2
 python main.py workzone
 python main.py "workzone with bp"
 ```
@@ -56,6 +57,7 @@ Available runtime scenarios in this workspace:
 - `scenario4`
 - `VRU`
 - `red_light_violation_warning`
+- `red_light_violation_warning_2`
 - `workzone`
 - `workzone with bp`
 
@@ -158,27 +160,27 @@ At each stage, the rollout:
 2. Computes line-of-sight heading:
 
 $$
-\psi^{los}_k = \operatorname{atan2}(y^{target}_k - y_k,\ x^{target}_k - x_k)
+\psi^{los}_k = atan2(y^{target}_k - y_k,\ x^{target}_k - x_k)
 $$
 
 3. Blends path heading and line-of-sight heading:
 
 $$
 \psi^{des}_k =
-\operatorname{atan2}\Big(
+atan2(
 (1-w)\sin(\psi^{path}_k) + w\sin(\psi^{los}_k),\ 
 (1-w)\cos(\psi^{path}_k) + w\cos(\psi^{los}_k)
-\Big)
+)
 $$
 
 4. Converts heading error into guessed steering:
 
 $$
-e^\psi_k = \operatorname{wrap}(\psi^{des}_k - \psi_k)
+e^\psi_k = wrap(\psi^{des}_k - \psi_k)
 $$
 
 $$
-\delta^{des}_k = \operatorname{clamp}(k_h e^\psi_k,\ \delta_{min},\ \delta_{max})
+\delta^{des}_k = clamp(k_h e^\psi_k,\ \delta_{min},\ \delta_{max})
 $$
 
 5. Chooses a guessed speed target.
@@ -188,7 +190,7 @@ $$
 6. Converts speed error into guessed acceleration:
 
 $$
-a^{des}_k = \operatorname{clamp}(k_v (v^{target}_k - v_k),\ a_{min},\ a_{max})
+a^{des}_k = clamp(k_v (v^{target}_k - v_k),\ a_{min},\ a_{max})
 $$
 
 7. Propagates the nonlinear bicycle model one step.
@@ -287,6 +289,24 @@ $$
 y_s = y_0 + \Delta v T_r + \frac{\Delta v^2}{2 a_{comfort}}
 $$
 
+The live project also applies geometric limits to keep the field size bounded:
+
+$$
+x_c \leftarrow \min\left(x_c,\ \frac{L_{max}}{2}\right), \qquad
+x_s \leftarrow \min\left(x_s,\ \frac{L_{max}}{2}\right)
+$$
+
+$$
+y_c \leftarrow \min\left(y_c,\ \frac{W_{lane} f_{lane}}{2}\right), \qquad
+y_s \leftarrow \min\left(y_s,\ \frac{W_{lane} f_{lane}}{2}\right)
+$$
+
+where:
+
+- $L_{max}$ = `max_longitudinal_zone_length_m`
+- $W_{lane}$ = lane width from the road config
+- $f_{lane}$ = `max_lateral_zone_lane_fraction`
+
 ### Super-ellipsoid normalized distances
 
 $$
@@ -328,6 +348,7 @@ The same live super-ellipsoid safe/collision zones can also be visualized in
 the `pygame` window through:
 
 - `MPC/mpc.yaml -> mpc.cost.repulsive_potential.visualization.enabled`
+- `grid_resolution`, `draw_margin_m`, `safe_zone_color_rgba`, and `collision_zone_color_rgba`
 
 ## Cost Function
 
@@ -346,7 +367,7 @@ w_{att}
 q_x (x_k - x_{ref})^2 +
 q_y (y_k - y_{ref})^2 +
 q_v (v_k - v_{ref})^2 +
-q_\psi \operatorname{wrap}(\psi_k - \psi_{ref})^2
+q_\psi wrap(\psi_k - \psi_{ref})^2
 \right)
 $$
 
@@ -369,7 +390,7 @@ w_k = w_0 \alpha^{k-1}
 $$
 
 $$
-J_{lane,k} = w_k \left((e^{lat}_k)^2 + q_{\psi,lane}\operatorname{wrap}(\psi_k - \psi^{lane}_k)^2 \right)
+J_{lane,k} = w_k \left((e^{lat}_k)^2 + q_{\psi,lane} wrap(\psi_k - \psi^{lane}_k)^2 \right)
 $$
 
 At the current default values, `q_psi` in the lane-center term may be zero, which means the lane term is acting as lateral position error only.
@@ -516,7 +537,9 @@ Main planner settings:
 - `cost.control.*`
   Smoothness penalty on acceleration and steering changes.
 - `cost.repulsive_potential.*`
-  Super-ellipsoid obstacle potential parameters.
+  Super-ellipsoid obstacle potential parameters, plus live visualization and
+  field-size limits (`max_longitudinal_zone_length_m`,
+  `limit_lateral_zone_to_lane_width`, `max_lateral_zone_lane_fraction`).
 - `solver.*`
   OSQP iteration and tolerance settings.
 
@@ -592,6 +615,8 @@ Each scenario typically contains:
   Curved-road scenario with fixed final destination on the ego lane.
 - `red_light_violation_warning`
   Curved-road scenario with a traffic-light proxy and stop-before-light behavior.
+- `red_light_violation_warning_2`
+  Variant of the red-light scenario used for additional behavior and stability tests.
 - `workzone`
   Workzone scenario with behavior-planner destination reassignment.
 - `workzone with bp`
