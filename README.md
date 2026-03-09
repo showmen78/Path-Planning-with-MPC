@@ -15,9 +15,27 @@ The runtime path is:
 
 `super_ellipsoid.py` is kept as a reference/analysis script. The live obstacle potential used by MPC is implemented inside `MPC/mpc.py`, but it follows the same super-ellipsoid idea.
 
-## Entry Point
+## Installation
 
-- Run a scenario:
+From the project root, create/activate a Python environment and install the dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+If you use Conda instead:
+
+```bash
+conda create -n mpc_custom python=3.10 -y
+conda activate mpc_custom
+pip install -r requirements.txt
+```
+
+## Running The Project
+
+Run a scenario from the project root:
 
 ```bash
 python main.py scenario4
@@ -26,6 +44,20 @@ python main.py red_light_violation_warning
 python main.py workzone
 python main.py "workzone with bp"
 ```
+
+General form:
+
+```bash
+python main.py <scenario_name>
+```
+
+Available runtime scenarios in this workspace:
+
+- `scenario4`
+- `VRU`
+- `red_light_violation_warning`
+- `workzone`
+- `workzone with bp`
 
 ## Project Structure
 
