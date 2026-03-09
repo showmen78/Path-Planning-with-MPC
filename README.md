@@ -1,4 +1,4 @@
-# MPC Custom (Potential / Exp Potential)
+# MPC for Path Planning
 
 This project simulates an ego vehicle that plans a future trajectory with linear time-varying MPC and then tracks that planned trajectory with a PID controller in `pygame`.
 
