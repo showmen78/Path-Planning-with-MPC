@@ -100,9 +100,9 @@ vehicles:
   # Obstacle 2: adjacent lane, beside obstacle 1.
   - vehicle_id: "obs_adjacent"
     type: "surrounding_vehicle"
-    initial_state: [-40.0, -1.83, 0.0, 0.0]
+    initial_state: [-30.0, -1.83, 0.0, 0.0]
     motion_mode: "lane_waypoint_follow"
-    desired_speed_mps: 7.0
+    desired_speed_mps: 0.0
     steer_kp: 1.8
     speed_kp: 1.5
     wheelbase_m: 2.0

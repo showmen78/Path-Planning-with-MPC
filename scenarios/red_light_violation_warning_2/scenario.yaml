@@ -102,11 +102,11 @@ vehicles:
     type: "surrounding_vehicle"
     initial_state: [-40.0, -1.83, 0.0, 0.0]
     motion_mode: "lane_waypoint_follow"
-    desired_speed_mps: 3.0
+    desired_speed_mps: 1.0
     steer_kp: 1.8
     speed_kp: 1.5
     wheelbase_m: 2.0
-    length_m: 4.5
+    length_m: 10.5
     width_m: 2.0
     color_rgb: [235, 170, 80]
 
@@ -119,7 +119,7 @@ vehicles:
     steer_kp: 1.8
     speed_kp: 1.5
     wheelbase_m: 2.0
-    length_m: 4.5
+    length_m: 8.5
     width_m: 2.0
     color_rgb: [235, 170, 80]
 

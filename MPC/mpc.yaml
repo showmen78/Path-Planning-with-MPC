@@ -183,10 +183,10 @@ mpc:
       # State-tracking weights toward [x_ref, y_ref, v_ref, psi_ref].
       # Increase a component -> more importance for that state channel.
       # Decrease a component -> less importance for that channel.
-      q_x: 1
+      q_x: 10
       q_y: 0
-      q_v: 3.0
-      q_psi: 2.0
+      q_v: 1.0
+      q_psi: 0.0
 
     lane_center_follow:
       # Enable/disable the lane-center-follow cost.
@@ -196,13 +196,13 @@ mpc:
       #   w_k = w0 * alpha^(k-1)
       # Increase -> stronger pull to the lane center and lane heading.
       # Decrease -> weaker lane-centering behavior.
-      w0: 15.0
+      w0: 30.0
 
       # Additional heading-error weight inside the lane-center term:
       #   w_k * q_psi * wrap(psi - psi_lane)^2
       # Increase -> stronger lane-heading alignment.
       # Decrease -> lane-center cost behaves more like pure lateral position.
-      q_psi: 0.0
+      q_psi: 10.0
 
       # Stage decay factor for lane-center weight.
       # Increase toward 1.0 -> far-horizon lane error matters more.
@@ -221,39 +221,74 @@ mpc:
       # Increase -> smoother change in that actuator.
       # Decrease -> faster actuator changes allowed.
       q_a: 10.0
-      q_delta: 20 #50
+      q_delta: 10 #50
 
     # Super-ellipsoid obstacle potential used in the live MPC objective.
     #
     # For each obstacle and stage:
-    #   delta_s = max(0, 1 - r_s)
-    #   delta_c = max(0, 1 - r_c)
-    #   J_obs   = w_s * delta_s^2 + w_c * (exp(k_c * delta_c) - 1)
+    #   J_obs = J_safe + J_collision
+    #   J_safe      = w_s * exp(-k_s * (r_s - s_s))
+    #   J_collision = w_c * exp(-k_c * (r_c - s_c))
     #
-    # r_s is the normalized distance to the larger safe zone and r_c is the
-    # normalized distance to the tighter collision zone.
+    # where:
+    #   r_s = normalized distance to the larger safe zone
+    #   r_c = normalized distance to the tighter collision zone
+    #   w_s = w_safe_zone
+    #   w_c = w_collision_zone
+    #   k_s = safe_exponential_gain
+    #   k_c = collision_exponential_gain
+    #   s_s = safe_distance_shift
+    #   s_c = collision_distance_shift
+    #
+    # Both terms stay active for all distances. When r becomes smaller than the
+    # corresponding shift, that zone's exponential cost grows rapidly.
     repulsive_potential:
       enabled: true
 
-      # Safe-zone weight w_s.
-      # Increase -> stronger early caution in the outer safe zone.
-      # Decrease -> weaker early avoidance push.
-      w_safe_zone: 1.0e1
+      # Safe-zone weight w_s in:
+      #   J_safe = w_s * exp(-k_s * (r_s - s_s))
+      # Increase -> larger safe-zone cost at every distance.
+      # Decrease -> smaller safe-zone cost at every distance.
+      w_safe_zone: 1.0e2
 
-      # Collision-zone weight w_c.
-      # Increase -> much stronger cost once the ego enters the red collision
-      # zone. Decrease -> weaker collision response.
+      # Collision-zone weight w_c in:
+      #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+      # Increase -> larger collision-zone cost at every distance.
+      # Decrease -> smaller collision-zone cost at every distance.
       w_collision_zone: 100.0
 
-      # Exponential gain k_c inside the collision term.
-      # Increase -> collision cost rises faster inside the collision zone.
-      # Decrease -> gentler collision-zone growth.
-      collision_exponential_gain: 6.0
+      # Safe-zone exponential gain k_s in:
+      #   J_safe = w_s * exp(-k_s * (r_s - s_s))
+      # Increase -> safe-zone cost decays faster with distance and rises more
+      # sharply as r_s drops below s_s.
+      # Decrease -> safe-zone cost stays spread over a wider distance band.
+      safe_exponential_gain: 3.0
+
+      # Safe-zone distance shift s_s in:
+      #   J_safe = w_s * exp(-k_s * (r_s - s_s))
+      # Increase -> the same safe-zone cost level is moved farther away from
+      # the obstacle (larger r_s).
+      # Decrease -> the safe-zone cost peak is pulled closer to the obstacle.
+      safe_distance_shift: 1.5
+
+      # Collision-zone exponential gain k_c in:
+      #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+      # Increase -> collision cost decays faster with distance and rises more
+      # sharply as r_c drops below s_c.
+      # Decrease -> collision cost stays influential over a wider distance band.
+      collision_exponential_gain: 10.0
+
+      # Collision-zone distance shift s_c in:
+      #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+      # Increase -> the same collision cost level is moved farther away from
+      # the obstacle (larger r_c).
+      # Decrease -> the collision cost peak is pulled closer to the obstacle.
+      collision_distance_shift: 1.5
 
       # Max braking deceleration [m/s^2] used for collision-zone inflation.
       # Increase -> tighter collision zone.
       # Decrease -> larger collision zone.
-      max_braking_deceleration_mps2: 5.0
+      max_braking_deceleration_mps2: 10.0
 
       # Comfort deceleration [m/s^2] used for safe-zone inflation.
       # Increase -> smaller safe zone.
@@ -287,6 +322,30 @@ mpc:
       # tiny. Decrease -> narrower lateral inflation for near-parallel traffic.
       min_lateral_approach_speed_mps: 0.1
 
+      # Maximum full longitudinal field length [m] used to clamp the collision
+      # and safe-zone half-lengths:
+      #   x_c <- min(x_c, 0.5 * L_max)
+      #   x_s <- min(x_s, 0.5 * L_max)
+      # where L_max = max_longitudinal_zone_length_m.
+      # Increase -> allow the field to extend farther ahead/behind the obstacle.
+      # Decrease -> force a shorter longitudinal field.
+      max_longitudinal_zone_length_m: 15.0
+
+      # Clamp the lateral half-widths y_c and y_s so the full potential-field
+      # width does not exceed a fraction of the lane width:
+      #   y_c <- min(y_c, 0.5 * lane_width * f_lane)
+      #   y_s <- min(y_s, 0.5 * lane_width * f_lane)
+      # where f_lane = max_lateral_zone_lane_fraction.
+      # true  -> keep safe/collision field width within the lane width.
+      # false -> allow the field to spill across lane boundaries.
+      limit_lateral_zone_to_lane_width: true
+
+      # Lane-width fraction f_lane used in:
+      #   y_limit = 0.5 * lane_width * f_lane
+      # Increase toward 1.0 -> allow the field to use more of the lane width.
+      # Decrease -> force a narrower lateral field inside the lane.
+      max_lateral_zone_lane_fraction: 1
+
       # Project the local obstacle-cost Hessian to positive semidefinite form so
       # OSQP sees a convex quadratic approximation.
       project_hessian_psd: true
@@ -295,6 +354,35 @@ mpc:
       # Increase -> more numerical stability, but more curvature smoothing.
       # Decrease -> closer to the raw local Hessian, but less robust.
       min_hessian_eig: 1.0e-9
+
+      visualization:
+        # Draw the live super-ellipsoid field around each non-ego object in the
+        # pygame window using the same safe/collision zones as the MPC cost.
+        # true  -> show the potential-field overlay in all scenarios.
+        # false -> hide the overlay entirely.
+        enabled: true
+
+        # Raster resolution used before scaling/rotation for each obstacle
+        # field patch.
+        # Increase -> smoother contour edges, more CPU cost per frame.
+        # Decrease -> faster rendering, rougher contour edges.
+        grid_resolution: 120
+
+        # Extra padding [m] drawn outside the larger of the safe/collision
+        # zones so the overlay is not clipped too tightly.
+        # Increase -> larger visible field footprint.
+        # Decrease -> tighter crop around the field.
+        draw_margin_m: 0.5
+
+        # RGBA color used for the safe zone where r_s <= 1.
+        # Increase alpha -> stronger green overlay.
+        # Decrease alpha -> more transparent green overlay.
+        safe_zone_color_rgba: [0, 200, 0, 70]
+
+        # RGBA color used for the collision zone where r_c <= 1.
+        # Increase alpha -> stronger red overlay.
+        # Decrease alpha -> more transparent red overlay.
+        collision_zone_color_rgba: [220, 40, 40, 110]
 
   solver:
     # Maximum OSQP iterations.

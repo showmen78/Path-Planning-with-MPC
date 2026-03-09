@@ -41,7 +41,7 @@ road:
 # The scenario code projects this longitudinal anchor onto the ego vehicle's
 # current lane center once at startup and then keeps that final destination
 # fixed for the full run.
-destination: [810.0, -2.11, 0.0, 0.231]
+destination: [70.0, 5.11, 0.0, 0.231]
 
 behavior_planner:
   # Disabled for this scenario: the final destination must stay fixed instead
@@ -80,7 +80,7 @@ tracker:
 vehicles:
   - vehicle_id: "ego"
     type: "ego"
-    initial_state: [-72.46, -1.0, 0.0, 0.224]
+    initial_state: [-72.46, -3.0, 0, 0.4]
     wheelbase_m: 2.0
     length_m: 4.5
     width_m: 2.0

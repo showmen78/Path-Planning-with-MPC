@@ -304,24 +304,30 @@ where $n$ is the super-ellipsoid shape exponent.
 The current live obstacle cost is:
 
 $$
-\delta_s = \max(0,\ 1-r_s)
+J_{safe} = w_s \exp\left(-k_s (r_s - s_s)\right)
 $$
 
 $$
-\delta_c = \max(0,\ 1-r_c)
+J_{collision} = w_c \exp\left(-k_c (r_c - s_c)\right)
 $$
 
 $$
-J_{obs} = w_s \delta_s^2 + w_c \left(e^{k_c \delta_c} - 1\right)
+J_{obs} = J_{safe} + J_{collision}
 $$
 
 Interpretation:
 
-- outside the safe zone: $r_s > 1$, so $\delta_s = 0$, no safe-zone penalty
-- inside the safe zone: quadratic penalty grows
-- inside the collision zone: the exponential term turns on and grows fast
+- both terms are always active
+- smaller $r_s$ or $r_c$ produces larger cost
+- $k_s, k_c$ control how sharply the cost changes with distance
+- $s_s, s_c$ shift where the exponential reaches the reference level
 
 The local obstacle cost is Taylor-expanded around the reference rollout so it can be inserted into the convex QP.
+
+The same live super-ellipsoid safe/collision zones can also be visualized in
+the `pygame` window through:
+
+- `MPC/mpc.yaml -> mpc.cost.repulsive_potential.visualization.enabled`
 
 ## Cost Function
 

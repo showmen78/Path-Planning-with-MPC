@@ -89,19 +89,27 @@ class MPCRepulsivePotentialSpec:
     Super-ellipsoid repulsive potential configuration.
 
     For each obstacle and stage:
-        delta_s = max(0, 1 - r_s)
-        delta_c = max(0, 1 - r_c)
-        J_obs   = w_s * delta_s^2 + w_c * (exp(k_c * delta_c) - 1)
+        J_obs = w_s * exp(-k_s * (r_s - s_s))
+              + w_c * exp(-k_c * (r_c - s_c))
 
     where:
         r_s : normalized distance to the larger safe zone
         r_c : normalized distance to the tighter collision zone
+        w_s : safe-zone weight
+        w_c : collision-zone weight
+        k_s : safe-zone exponential gain
+        k_c : collision-zone exponential gain
+        s_s : safe-zone distance shift
+        s_c : collision-zone distance shift
     """
 
     enabled: bool
     w_safe_zone: float
     w_collision_zone: float
+    safe_exponential_gain: float
+    safe_distance_shift: float
     collision_exponential_gain: float
+    collision_distance_shift: float
     max_braking_deceleration_mps2: float
     comfort_deceleration_mps2: float
     reaction_time_s: float
@@ -109,6 +117,9 @@ class MPCRepulsivePotentialSpec:
     static_lateral_buffer_m: float
     shape_exponent: float
     min_lateral_approach_speed_mps: float
+    max_longitudinal_zone_length_m: float
+    limit_lateral_zone_to_lane_width: bool
+    max_lateral_zone_lane_fraction: float
     project_hessian_psd: bool
     min_hessian_eig: float
 
@@ -263,7 +274,10 @@ class MPC:
             enabled=bool(repulsive_cfg.get("enabled", True)),
             w_safe_zone=max(0.0, float(repulsive_cfg.get("w_safe_zone", 10.0))),
             w_collision_zone=max(0.0, float(repulsive_cfg.get("w_collision_zone", 100.0))),
+            safe_exponential_gain=max(0.0, float(repulsive_cfg.get("safe_exponential_gain", 10.0))),
+            safe_distance_shift=float(repulsive_cfg.get("safe_distance_shift", 1.5)),
             collision_exponential_gain=max(0.0, float(repulsive_cfg.get("collision_exponential_gain", 6.0))),
+            collision_distance_shift=float(repulsive_cfg.get("collision_distance_shift", 1.5)),
             max_braking_deceleration_mps2=max(
                 1e-6,
                 float(
@@ -296,6 +310,17 @@ class MPC:
             min_lateral_approach_speed_mps=max(
                 1e-6,
                 float(repulsive_cfg.get("min_lateral_approach_speed_mps", 0.1)),
+            ),
+            max_longitudinal_zone_length_m=max(
+                1e-6,
+                float(repulsive_cfg.get("max_longitudinal_zone_length_m", 10.0)),
+            ),
+            limit_lateral_zone_to_lane_width=bool(
+                repulsive_cfg.get("limit_lateral_zone_to_lane_width", True)
+            ),
+            max_lateral_zone_lane_fraction=max(
+                1e-3,
+                float(repulsive_cfg.get("max_lateral_zone_lane_fraction", 1.0)),
             ),
             project_hessian_psd=bool(repulsive_cfg.get("project_hessian_psd", repulsive_cfg.get("taylor_project_hessian_psd", True))),
             min_hessian_eig=max(
@@ -762,11 +787,12 @@ class MPC:
         Super-ellipsoid obstacle cost components from `super_ellipsoid.py`.
 
         Cost:
-            J_obs = w_s * delta_s^2 + w_c * (exp(k_c * delta_c) - 1)
+            J_obs = w_s * exp(-k_s * (r_s - s_s))
+                  + w_c * exp(-k_c * (r_c - s_c))
 
         where:
-            delta_s = max(0, 1 - r_s)
-            delta_c = max(0, 1 - r_c)
+            r_s = normalized distance to the safe zone
+            r_c = normalized distance to the collision zone
         """
 
         ego_x_m = float(ego_state[0]) if len(ego_state) >= 1 else 0.0
@@ -814,15 +840,28 @@ class MPC:
         xs_m = x0_m + delta_u_mps * reaction_time_s + (delta_u_mps * delta_u_mps) / (2.0 * a_comfort_mps2)
         ys_m = y0_m + delta_v_mps * reaction_time_s + (delta_v_mps * delta_v_mps) / (2.0 * a_comfort_mps2)
 
+        longitudinal_half_limit_m = 0.5 * float(self.repulsive_cost.max_longitudinal_zone_length_m)
+        longitudinal_half_limit_m = max(1e-6, float(longitudinal_half_limit_m))
+        xc_m = min(float(xc_m), longitudinal_half_limit_m)
+        xs_m = min(float(xs_m), longitudinal_half_limit_m)
+
+        if bool(self.repulsive_cost.limit_lateral_zone_to_lane_width):
+            lateral_half_limit_m = 0.5 * float(self.lane_width_m) * float(self.repulsive_cost.max_lateral_zone_lane_fraction)
+            lateral_half_limit_m = max(1e-6, float(lateral_half_limit_m))
+            yc_m = min(float(yc_m), lateral_half_limit_m)
+            ys_m = min(float(ys_m), lateral_half_limit_m)
+
         n = max(2.0, float(self.repulsive_cost.shape_exponent))
         rc = (abs(float(x_local_m) / max(1e-6, float(xc_m))) ** n + abs(float(y_local_m) / max(1e-6, float(yc_m))) ** n) ** (1.0 / n)
         rs = (abs(float(x_local_m) / max(1e-6, float(xs_m))) ** n + abs(float(y_local_m) / max(1e-6, float(ys_m))) ** n) ** (1.0 / n)
 
-        delta_s = max(0.0, 1.0 - float(rs))
-        delta_c = max(0.0, 1.0 - float(rc))
-        cost_safe = float(self.repulsive_cost.w_safe_zone) * delta_s * delta_s
-        cost_collision = float(self.repulsive_cost.w_collision_zone) * (
-            math.exp(float(self.repulsive_cost.collision_exponential_gain) * delta_c) - 1.0
+        cost_safe = float(self.repulsive_cost.w_safe_zone) * math.exp(
+            -float(self.repulsive_cost.safe_exponential_gain)
+            * (float(rs) - float(self.repulsive_cost.safe_distance_shift))
+        )
+        cost_collision = float(self.repulsive_cost.w_collision_zone) * math.exp(
+            -float(self.repulsive_cost.collision_exponential_gain)
+            * (float(rc) - float(self.repulsive_cost.collision_distance_shift))
         )
         return float(cost_safe), float(cost_collision)
 

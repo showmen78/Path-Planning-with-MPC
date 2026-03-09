@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Iterable, Mapping, Sequence, Tuple
 import math
 
+import numpy as np
 import pygame
 
 
@@ -186,6 +187,251 @@ def draw_predicted_object_trajectories(
                 )
             )
         _draw_dotted_polyline(surface, points_px, color_rgb, 10, 2)
+
+
+def _compute_superellipsoid_zone_geometry(
+    ego_snapshot: Mapping[str, object],
+    obstacle_snapshot: Mapping[str, object],
+    repulsive_cfg: Mapping[str, object],
+    lane_width_m: float,
+) -> Mapping[str, float] | None:
+    """
+    Compute the live MPC super-ellipsoid geometry and the tighter visual
+    drawing sizes used for the overlay.
+    """
+
+    ego_state = list(ego_snapshot.get("current_state", []))
+    obstacle_state = list(obstacle_snapshot.get("current_state", []))
+    if len(ego_state) < 4 or len(obstacle_state) < 4:
+        return None
+
+    ego_v_mps = max(0.0, float(ego_state[2]))
+    ego_psi_rad = float(ego_state[3])
+    obs_v_mps = max(0.0, float(obstacle_state[2]))
+    obs_psi_rad = float(obstacle_state[3])
+
+    ego_length_m = max(1e-6, float(ego_snapshot.get("length_m", 4.5)))
+    ego_width_m = max(1e-6, float(ego_snapshot.get("width_m", 2.0)))
+    obstacle_length_m = max(1e-6, float(obstacle_snapshot.get("length_m", 4.5)))
+    obstacle_width_m = max(1e-6, float(obstacle_snapshot.get("width_m", 2.0)))
+
+    heading_diff_rad = float(ego_psi_rad) - float(obs_psi_rad)
+    v_approach_longitudinal_mps = float(ego_v_mps) * math.cos(heading_diff_rad) - float(obs_v_mps)
+    v_approach_lateral_mps = float(ego_v_mps) * math.sin(heading_diff_rad)
+    delta_u_mps = max(0.0, float(v_approach_longitudinal_mps))
+    delta_v_mps = max(
+        max(0.0, float(repulsive_cfg.get("min_lateral_approach_speed_mps", 0.1))),
+        abs(float(v_approach_lateral_mps)),
+    )
+
+    projected_ego_length_m = abs(float(ego_length_m) * math.cos(heading_diff_rad))
+    projected_ego_length_m += abs(float(ego_width_m) * math.sin(heading_diff_rad))
+    projected_ego_width_m = abs(float(ego_length_m) * math.sin(heading_diff_rad))
+    projected_ego_width_m += abs(float(ego_width_m) * math.cos(heading_diff_rad))
+
+    x0_m = 0.5 * (projected_ego_length_m + float(obstacle_length_m))
+    x0_m += max(0.0, float(repulsive_cfg.get("static_longitudinal_buffer_m", 0.5)))
+    y0_m = 0.5 * (projected_ego_width_m + float(obstacle_width_m))
+    y0_m += max(0.0, float(repulsive_cfg.get("static_lateral_buffer_m", 1.0)))
+
+    max_braking_mps2 = max(1e-6, float(repulsive_cfg.get("max_braking_deceleration_mps2", 5.0)))
+    comfort_mps2 = max(1e-6, float(repulsive_cfg.get("comfort_deceleration_mps2", 2.0)))
+    reaction_time_s = max(0.0, float(repulsive_cfg.get("reaction_time_s", 1.0)))
+
+    xc_raw_m = x0_m + (delta_u_mps * delta_u_mps) / (2.0 * max_braking_mps2)
+    yc_raw_m = y0_m + (delta_v_mps * delta_v_mps) / (2.0 * max_braking_mps2)
+    xs_raw_m = x0_m + delta_u_mps * reaction_time_s + (delta_u_mps * delta_u_mps) / (2.0 * comfort_mps2)
+    ys_raw_m = y0_m + delta_v_mps * reaction_time_s + (delta_v_mps * delta_v_mps) / (2.0 * comfort_mps2)
+
+    xc_m = float(xc_raw_m)
+    yc_m = float(yc_raw_m)
+    xs_m = float(xs_raw_m)
+    ys_m = float(ys_raw_m)
+
+    longitudinal_half_limit_m = 0.5 * max(1e-6, float(repulsive_cfg.get("max_longitudinal_zone_length_m", 10.0)))
+    xc_m = min(float(xc_m), longitudinal_half_limit_m)
+    xs_m = min(float(xs_m), longitudinal_half_limit_m)
+
+    if bool(repulsive_cfg.get("limit_lateral_zone_to_lane_width", True)):
+        lateral_half_limit_m = 0.5 * max(1e-6, float(lane_width_m))
+        lateral_half_limit_m *= max(1e-3, float(repulsive_cfg.get("max_lateral_zone_lane_fraction", 1.0)))
+        yc_m = min(float(yc_m), lateral_half_limit_m)
+        ys_m = min(float(ys_m), lateral_half_limit_m)
+
+    # Match the visual convention used in super_ellipsoid.py: draw the zone
+    # around the obstacle body itself instead of the full ego-center Minkowski
+    # sum used internally by the MPC cost.
+    visual_longitudinal_inflation_m = 0.5 * projected_ego_length_m
+    visual_longitudinal_inflation_m += max(0.0, float(repulsive_cfg.get("static_longitudinal_buffer_m", 0.5)))
+    visual_lateral_inflation_m = 0.5 * projected_ego_width_m
+    visual_lateral_inflation_m += max(0.0, float(repulsive_cfg.get("static_lateral_buffer_m", 1.0)))
+
+    draw_xc_m = max(0.5 * float(obstacle_length_m), float(xc_raw_m) - visual_longitudinal_inflation_m)
+    draw_xs_m = max(0.5 * float(obstacle_length_m), float(xs_raw_m) - visual_longitudinal_inflation_m)
+    draw_yc_m = max(0.5 * float(obstacle_width_m), float(yc_raw_m) - visual_lateral_inflation_m)
+    draw_ys_m = max(0.5 * float(obstacle_width_m), float(ys_raw_m) - visual_lateral_inflation_m)
+
+    draw_xc_m = min(float(draw_xc_m), longitudinal_half_limit_m)
+    draw_xs_m = min(float(draw_xs_m), longitudinal_half_limit_m)
+
+    if bool(repulsive_cfg.get("limit_lateral_zone_to_lane_width", True)):
+        draw_lateral_half_limit_m = 0.5 * max(1e-6, float(lane_width_m))
+        draw_lateral_half_limit_m *= max(1e-3, float(repulsive_cfg.get("max_lateral_zone_lane_fraction", 1.0)))
+        draw_yc_m = min(float(draw_yc_m), draw_lateral_half_limit_m)
+        draw_ys_m = min(float(draw_ys_m), draw_lateral_half_limit_m)
+
+    return {
+        "xc_m": float(max(1e-3, xc_m)),
+        "yc_m": float(max(1e-3, yc_m)),
+        "xs_m": float(max(1e-3, xs_m)),
+        "ys_m": float(max(1e-3, ys_m)),
+        "draw_xc_m": float(max(0.1, draw_xc_m)),
+        "draw_yc_m": float(max(0.1, draw_yc_m)),
+        "draw_xs_m": float(max(0.1, draw_xs_m)),
+        "draw_ys_m": float(max(0.1, draw_ys_m)),
+    }
+
+
+def _superellipse_polygon_points(
+    center_x_m: float,
+    center_y_m: float,
+    heading_rad: float,
+    half_length_m: float,
+    half_width_m: float,
+    exponent: float,
+    sample_count: int,
+    camera_center_world: Tuple[float, float],
+    pixels_per_meter: float,
+    screen_center_px: Tuple[float, float],
+) -> Sequence[Tuple[int, int]]:
+    """
+    Sample a super-ellipse in the obstacle local frame and transform it into
+    screen points using the same body-frame rotation convention as vehicle.draw.
+    """
+
+    half_length_m = max(1e-6, float(half_length_m))
+    half_width_m = max(1e-6, float(half_width_m))
+    exponent = max(2.0, float(exponent))
+    sample_count = max(32, int(sample_count))
+
+    cos_psi = math.cos(float(heading_rad))
+    sin_psi = math.sin(float(heading_rad))
+    points_px = []
+    for theta_rad in np.linspace(0.0, 2.0 * math.pi, sample_count, endpoint=False):
+        cos_theta = math.cos(float(theta_rad))
+        sin_theta = math.sin(float(theta_rad))
+        local_x_m = math.copysign(
+            half_length_m * (abs(cos_theta) ** (2.0 / exponent)),
+            cos_theta,
+        )
+        local_y_m = math.copysign(
+            half_width_m * (abs(sin_theta) ** (2.0 / exponent)),
+            sin_theta,
+        )
+        world_x_m = float(center_x_m) + local_x_m * cos_psi - local_y_m * sin_psi
+        world_y_m = float(center_y_m) + local_x_m * sin_psi + local_y_m * cos_psi
+        points_px.append(
+            world_to_screen(
+                world_x_m,
+                world_y_m,
+                camera_center_world,
+                pixels_per_meter,
+                screen_center_px,
+            )
+        )
+    return points_px
+
+
+def draw_obstacle_potential_fields(
+    surface: pygame.Surface,
+    ego_snapshot: Mapping[str, object],
+    object_snapshots: Sequence[Mapping[str, object]],
+    camera_center_world: Tuple[float, float],
+    pixels_per_meter: float,
+    repulsive_cfg: Mapping[str, object],
+    lane_width_m: float,
+) -> None:
+    """
+    Visualize the live super-ellipsoid safe/collision zones around each
+    non-ego object using the same geometry model as the MPC obstacle cost.
+    """
+
+    visualization_cfg = dict(repulsive_cfg.get("visualization", {}))
+    if not bool(visualization_cfg.get("enabled", False)):
+        return
+
+    width_px, height_px = surface.get_size()
+    screen_center = (0.5 * width_px, 0.5 * height_px)
+    ppm = max(1e-6, float(pixels_per_meter))
+    contour_resolution = max(48, int(visualization_cfg.get("grid_resolution", 120)))
+    draw_margin_m = max(0.0, float(visualization_cfg.get("draw_margin_m", 0.5)))
+    safe_color_rgba = tuple(int(v) for v in visualization_cfg.get("safe_zone_color_rgba", [0, 200, 0, 70]))
+    collision_color_rgba = tuple(int(v) for v in visualization_cfg.get("collision_zone_color_rgba", [220, 40, 40, 110]))
+    shape_exponent = max(2.0, float(repulsive_cfg.get("shape_exponent", 4.0)))
+    overlay_surface = pygame.Surface((width_px, height_px), pygame.SRCALPHA)
+
+    for obstacle_snapshot in object_snapshots:
+        if str(obstacle_snapshot.get("type", "")).strip().lower() == "ego":
+            continue
+
+        zone_geometry = _compute_superellipsoid_zone_geometry(
+            ego_snapshot=ego_snapshot,
+            obstacle_snapshot=obstacle_snapshot,
+            repulsive_cfg=repulsive_cfg,
+            lane_width_m=lane_width_m,
+        )
+        if zone_geometry is None:
+            continue
+
+        draw_xc_m = float(zone_geometry["draw_xc_m"])
+        draw_yc_m = float(zone_geometry["draw_yc_m"])
+        draw_xs_m = float(zone_geometry["draw_xs_m"])
+        draw_ys_m = float(zone_geometry["draw_ys_m"])
+        half_draw_x_m = max(draw_xc_m, draw_xs_m) + draw_margin_m
+        half_draw_y_m = max(draw_yc_m, draw_ys_m) + draw_margin_m
+        draw_width_px = max(2, int(round(2.0 * half_draw_x_m * ppm)))
+        draw_height_px = max(2, int(round(2.0 * half_draw_y_m * ppm)))
+
+        obs_x_m = float(obstacle_snapshot.get("x", 0.0))
+        obs_y_m = float(obstacle_snapshot.get("y", 0.0))
+        center_px = world_to_screen(obs_x_m, obs_y_m, camera_center_world, pixels_per_meter, screen_center)
+        if (
+            center_px[0] + draw_width_px < 0
+            or center_px[0] - draw_width_px > width_px
+            or center_px[1] + draw_height_px < 0
+            or center_px[1] - draw_height_px > height_px
+        ):
+            continue
+
+        obstacle_heading_rad = float(obstacle_snapshot.get("psi", 0.0))
+        safe_polygon_px = _superellipse_polygon_points(
+            center_x_m=obs_x_m,
+            center_y_m=obs_y_m,
+            heading_rad=obstacle_heading_rad,
+            half_length_m=draw_xs_m,
+            half_width_m=draw_ys_m,
+            exponent=shape_exponent,
+            sample_count=contour_resolution,
+            camera_center_world=camera_center_world,
+            pixels_per_meter=pixels_per_meter,
+            screen_center_px=screen_center,
+        )
+        collision_polygon_px = _superellipse_polygon_points(
+            center_x_m=obs_x_m,
+            center_y_m=obs_y_m,
+            heading_rad=obstacle_heading_rad,
+            half_length_m=draw_xc_m,
+            half_width_m=draw_yc_m,
+            exponent=shape_exponent,
+            sample_count=contour_resolution,
+            camera_center_world=camera_center_world,
+            pixels_per_meter=pixels_per_meter,
+            screen_center_px=screen_center,
+        )
+        pygame.draw.polygon(overlay_surface, safe_color_rgba, safe_polygon_px)
+        pygame.draw.polygon(overlay_surface, collision_color_rgba, collision_polygon_px)
+
+    surface.blit(overlay_surface, (0, 0))
 
 
 def _nice_scale_step_m(min_step_m: float) -> float:

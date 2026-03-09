@@ -46,6 +46,7 @@ from utility.rendering import (
     draw_destination,
     draw_dotted_trajectory,
     draw_hud_text,
+    draw_obstacle_potential_fields,
     draw_predicted_object_trajectories,
     draw_world_scale,
     screen_to_world,
@@ -762,6 +763,16 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                 world_to_screen_fn=None,
             )
             lane_center_waypoints = list(scenario_handler.get_latest_lane_waypoints())
+
+            draw_obstacle_potential_fields(
+                surface=screen,
+                ego_snapshot=ego_snapshot,
+                object_snapshots=object_snapshots,
+                camera_center_world=camera_center_world,
+                pixels_per_meter=pixels_per_meter,
+                repulsive_cfg=dict(mpc_cfg.get("cost", {}).get("repulsive_potential", {})),
+                lane_width_m=float(road_cfg.get("lane_width_m", 4.0)),
+            )
 
             draw_destination(
                 surface=screen,
