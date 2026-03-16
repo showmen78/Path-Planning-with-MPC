@@ -519,7 +519,13 @@ def draw_world_scale(
     surface.blit(y_label, (y_axis_x_px + 8, margin_px))
 
 
-def draw_hud_text(surface: pygame.Surface, font: pygame.font.Font, lines: Iterable[str], top_left_px: Tuple[int, int]) -> None:
+def draw_hud_text(
+    surface: pygame.Surface,
+    font: pygame.font.Font,
+    lines: Iterable[str],
+    top_left_px: Tuple[int, int],
+    anchor: str = "left",
+) -> None:
     """
     Intent:
         Render a simple text HUD with one line per row.
@@ -531,5 +537,9 @@ def draw_hud_text(surface: pygame.Surface, font: pygame.font.Font, lines: Iterab
         text_surface = font.render(str(text), True, (245, 245, 245))
         shadow_surface = font.render(str(text), True, (20, 20, 20))
         y = y0 + idx * line_height
-        surface.blit(shadow_surface, (x0 + 1, y + 1))
-        surface.blit(text_surface, (x0, y))
+        if str(anchor).strip().lower() == "right":
+            x = x0 - int(text_surface.get_width())
+        else:
+            x = x0
+        surface.blit(shadow_surface, (x + 1, y + 1))
+        surface.blit(text_surface, (x, y))

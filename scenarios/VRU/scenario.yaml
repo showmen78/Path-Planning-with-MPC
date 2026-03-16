@@ -1,6 +1,6 @@
 simulation:
   dt_s: 0.05
-  start_delay_s: 0
+  start_delay_s: 5
   target_fps: 60
   visualization_horizon_s: 3.0
   replan_buffer_steps: 50
@@ -42,14 +42,6 @@ road:
 # current lane center once at startup and then keeps that final destination
 # fixed for the full run.
 destination: [70.0, 5.11, 0.0, 0.231]
-
-behavior_planner:
-  # Disabled for this scenario: the final destination must stay fixed instead
-  # of changing online.
-  enabled: false
-  trigger_x_m: 600.0
-  trigger_when_ego_x_ge: true
-  trigger_destination_state: [-0.32, -6.0, 0.0, -0.299]
 
 mpc:
   local_goal:

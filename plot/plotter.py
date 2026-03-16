@@ -444,3 +444,73 @@ class SimulationPlotter:
         )
 
         return outputs
+
+    def save_repulsive_cost_vs_distance_plot(
+        self,
+        scenario_name: str,
+        obstacle_distance_m: Sequence[float],
+        repulsive_safe_cost: Sequence[float],
+        repulsive_collision_cost: Sequence[float],
+        repulsive_total_cost: Sequence[float],
+        truncate_at_min_distance: bool = True,
+    ) -> List[str]:
+        """
+        Save a dedicated repulsive-potential plot versus ego-obstacle distance.
+
+        This is intended for demo scenarios where the user wants to inspect only
+        the potential-field terms:
+        - J_safe
+        - J_collision
+        - J_total = J_safe + J_collision
+        """
+
+        outputs: List[str] = []
+        if len(obstacle_distance_m) == 0:
+            return outputs
+
+        series = list(
+            zip(
+                [float(v) for v in obstacle_distance_m],
+                [float(v) for v in repulsive_safe_cost],
+                [float(v) for v in repulsive_collision_cost],
+                [float(v) for v in repulsive_total_cost],
+            )
+        )
+        series = [
+            item
+            for item in series
+            if len(item) == 4
+            and all(__import__("math").isfinite(value) for value in item)
+        ]
+        if len(series) == 0:
+            return outputs
+
+        if bool(truncate_at_min_distance) and len(series) > 1:
+            min_distance_index = min(range(len(series)), key=lambda idx: float(series[idx][0]))
+            series = series[: min_distance_index + 1]
+
+        if len(series) == 0:
+            return outputs
+
+        distance_m = [float(item[0]) for item in series]
+        safe_cost = [float(item[1]) for item in series]
+        collision_cost = [float(item[2]) for item in series]
+        total_cost = [float(item[3]) for item in series]
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = f"{scenario_name}_{timestamp}"
+
+        fig = self._new_figure()
+        ax = fig.add_subplot(1, 1, 1)
+        ax.plot(distance_m, safe_cost, color="#bcbd22", linewidth=2.0, label="J_safe")
+        ax.plot(distance_m, collision_cost, color="#d62728", linewidth=2.0, label="J_collision")
+        ax.plot(distance_m, total_cost, color="#8c564b", linewidth=2.0, label="J_total")
+        ax.set_title("Potential-Field Cost vs Ego-Obstacle Distance")
+        ax.set_xlabel("ego-obstacle center distance [m]")
+        ax.set_ylabel("cost")
+        self._set_x_axis_from_world_x(ax, distance_m)
+        ax.invert_xaxis()
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        outputs.append(self._save(fig, f"{prefix}_repulsive_cost_vs_distance.png"))
+        return outputs

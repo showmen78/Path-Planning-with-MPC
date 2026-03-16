@@ -8,6 +8,9 @@ osqp
 # YAML configuration loading.
 pyyaml
 
+# OpenAI API client used by the behavior-planner LLM loop.
+openai
+
 # Runtime visualization and vehicle/road rendering.
 pygame
 

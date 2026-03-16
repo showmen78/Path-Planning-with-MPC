@@ -41,14 +41,6 @@ road:
 # Final destination stays in the ego/reference lane.
 destination: [90.0, -1.83, 0.0, 0.0]
 
-behavior_planner:
-  enabled: true
-  traffic_light_vehicle_id: "traffic_light_proxy"
-  trigger_distance_m: 40.0 #60
-  stop_offset_before_light_m: 2.0
-  yellow_color_rgb: [235, 190, 40]
-  red_color_rgb: [230, 40, 40]
-
 mpc:
 
   local_goal:
@@ -86,7 +78,7 @@ vehicles:
   # Obstacle 1: right-most lane, ahead of ego.
   - vehicle_id: "obs_lane_right"
     type: "surrounding_vehicle"
-    initial_state: [-40.0, -5.49, 0.0, 0.0]
+    initial_state: [-40.0, -5.49, 0.0, 3]
     motion_mode: "lane_waypoint_follow"
     desired_speed_mps: 3.0
     steer_kp: 1.8
@@ -115,7 +107,7 @@ vehicles:
     type: "surrounding_vehicle"
     initial_state: [-60.0, 1.83, 0.0, 0.0]
     motion_mode: "lane_waypoint_follow"
-    desired_speed_mps: 3.0
+    desired_speed_mps: 10.0
     steer_kp: 1.8
     speed_kp: 1.5
     wheelbase_m: 2.0

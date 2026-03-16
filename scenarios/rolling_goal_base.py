@@ -24,6 +24,7 @@ class RollingGoalScenario:
         self._scenario_yaml_path = str(scenario_yaml_path)
         self._config: Dict[str, object] = load_yaml_file(self._scenario_yaml_path)
         self._runtime_lookahead_waypoint_count: int | None = None
+        self._runtime_local_goal_cfg: Dict[str, object] = {}
         self._road_model = RoadModel()
         self._lock_destination_to_final = False
         self._last_final_destination_xy: Tuple[float, float] | None = None
@@ -39,8 +40,23 @@ class RollingGoalScenario:
 
         if lookahead_waypoint_count is None:
             self._runtime_lookahead_waypoint_count = None
+            self._runtime_local_goal_cfg.pop("lookahead_waypoint_count", None)
             return
         self._runtime_lookahead_waypoint_count = max(1, int(lookahead_waypoint_count))
+        self._runtime_local_goal_cfg["lookahead_waypoint_count"] = self._runtime_lookahead_waypoint_count
+
+    def set_runtime_local_goal_config(self, local_goal_cfg: Mapping[str, object] | None) -> None:
+        """
+        Allow main.py to inject the shared rolling-goal configuration from
+        `MPC/mpc.yaml` while preserving the scenario-local override behavior.
+        """
+
+        self._runtime_local_goal_cfg = dict(local_goal_cfg or {})
+        lookahead_waypoint_count = self._runtime_local_goal_cfg.get("lookahead_waypoint_count")
+        if lookahead_waypoint_count is None:
+            self._runtime_lookahead_waypoint_count = None
+        else:
+            self._runtime_lookahead_waypoint_count = max(1, int(lookahead_waypoint_count))
 
     def draw_road(
         self,
@@ -71,6 +87,13 @@ class RollingGoalScenario:
     @staticmethod
     def _waypoint_key(x_m: float, y_m: float) -> Tuple[float, float]:
         return (round(float(x_m), 3), round(float(y_m), 3))
+
+    @staticmethod
+    def _distance_between_points(
+        start_xy: Tuple[float, float],
+        end_xy: Tuple[float, float],
+    ) -> float:
+        return math.hypot(float(end_xy[0]) - float(start_xy[0]), float(end_xy[1]) - float(start_xy[1]))
 
     def _infer_heading_from_waypoints(
         self,
@@ -149,6 +172,135 @@ class RollingGoalScenario:
                 return True
         return False
 
+    def _follow_waypoint_chain(
+        self,
+        start_waypoint: Mapping[str, object],
+        waypoint_by_xy: Mapping[Tuple[float, float], Mapping[str, object]],
+        max_distance_m: float | None,
+        max_waypoint_steps: int | None,
+        origin_xy: Tuple[float, float],
+    ) -> List[Mapping[str, object]]:
+        traversed_waypoints: List[Mapping[str, object]] = [start_waypoint]
+        start_position = self._position_of_waypoint(start_waypoint)
+        if start_position is None:
+            return traversed_waypoints
+
+        cumulative_distance_m = self._distance_between_points(origin_xy, start_position)
+        current_waypoint = start_waypoint
+        current_position = start_position
+        visited_keys = {self._waypoint_key(float(current_position[0]), float(current_position[1]))}
+
+        while True:
+            if max_distance_m is not None and cumulative_distance_m >= max_distance_m:
+                break
+            if max_waypoint_steps is not None and (len(traversed_waypoints) - 1) >= max_waypoint_steps:
+                break
+
+            next_position_raw = current_waypoint.get("next", None)
+            if not isinstance(next_position_raw, (list, tuple)) or len(next_position_raw) < 2:
+                break
+            next_key = self._waypoint_key(float(next_position_raw[0]), float(next_position_raw[1]))
+            if next_key in visited_keys:
+                break
+            next_waypoint = waypoint_by_xy.get(next_key)
+            if next_waypoint is None:
+                break
+
+            next_position = self._position_of_waypoint(next_waypoint)
+            if next_position is None:
+                break
+
+            cumulative_distance_m += self._distance_between_points(current_position, next_position)
+            traversed_waypoints.append(next_waypoint)
+            visited_keys.add(next_key)
+            current_waypoint = next_waypoint
+            current_position = next_position
+
+        return traversed_waypoints
+
+    def _collect_forward_sample_positions(
+        self,
+        start_waypoint: Mapping[str, object],
+        waypoint_by_xy: Mapping[Tuple[float, float], Mapping[str, object]],
+        origin_xy: Tuple[float, float],
+        target_distances_m: Sequence[float],
+    ) -> List[Tuple[float, float]]:
+        if len(target_distances_m) == 0:
+            return []
+
+        start_position = self._position_of_waypoint(start_waypoint)
+        if start_position is None:
+            return []
+
+        sample_positions: List[Tuple[float, float]] = []
+        cumulative_distance_m = self._distance_between_points(origin_xy, start_position)
+        current_waypoint = start_waypoint
+        current_position = start_position
+        visited_keys = {self._waypoint_key(float(current_position[0]), float(current_position[1]))}
+
+        while len(sample_positions) < len(target_distances_m) and cumulative_distance_m >= target_distances_m[len(sample_positions)]:
+            sample_positions.append((float(current_position[0]), float(current_position[1])))
+
+        while len(sample_positions) < len(target_distances_m):
+            next_position_raw = current_waypoint.get("next", None)
+            if not isinstance(next_position_raw, (list, tuple)) or len(next_position_raw) < 2:
+                break
+            next_key = self._waypoint_key(float(next_position_raw[0]), float(next_position_raw[1]))
+            if next_key in visited_keys:
+                break
+            next_waypoint = waypoint_by_xy.get(next_key)
+            if next_waypoint is None:
+                break
+
+            next_position = self._position_of_waypoint(next_waypoint)
+            if next_position is None:
+                break
+
+            cumulative_distance_m += self._distance_between_points(current_position, next_position)
+            current_waypoint = next_waypoint
+            current_position = next_position
+            visited_keys.add(next_key)
+
+            while len(sample_positions) < len(target_distances_m) and cumulative_distance_m >= target_distances_m[len(sample_positions)]:
+                sample_positions.append((float(current_position[0]), float(current_position[1])))
+
+        return sample_positions
+
+    def _estimate_path_curvature(
+        self,
+        start_waypoint: Mapping[str, object],
+        waypoint_by_xy: Mapping[Tuple[float, float], Mapping[str, object]],
+        origin_xy: Tuple[float, float],
+        sample_spacing_m: float,
+    ) -> float:
+        if sample_spacing_m <= 0.0:
+            return 0.0
+
+        sample_positions = self._collect_forward_sample_positions(
+            start_waypoint=start_waypoint,
+            waypoint_by_xy=waypoint_by_xy,
+            origin_xy=origin_xy,
+            target_distances_m=[sample_spacing_m, 2.0 * sample_spacing_m, 3.0 * sample_spacing_m],
+        )
+        if len(sample_positions) < 3:
+            return 0.0
+
+        p1, p2, p3 = sample_positions[0], sample_positions[1], sample_positions[2]
+        side_a = self._distance_between_points(p1, p2)
+        side_b = self._distance_between_points(p2, p3)
+        side_c = self._distance_between_points(p1, p3)
+        if min(side_a, side_b, side_c) <= 1e-9:
+            return 0.0
+
+        triangle_area = 0.5 * abs(
+            (float(p2[0]) - float(p1[0])) * (float(p3[1]) - float(p1[1]))
+            - (float(p3[0]) - float(p1[0])) * (float(p2[1]) - float(p1[1]))
+        )
+        if triangle_area <= 1e-12:
+            return 0.0
+
+        return float((4.0 * triangle_area) / (side_a * side_b * side_c))
+
     def _select_local_waypoint_target(
         self,
         lane_center_waypoints: Sequence[Mapping[str, object]],
@@ -157,6 +309,8 @@ class RollingGoalScenario:
         final_destination_state: Sequence[float],
         lookahead_waypoint_count: int,
         obstacle_snapshots: Sequence[Mapping[str, object]],
+        ego_speed_mps: float,
+        dynamic_lookahead_cfg: Mapping[str, object] | None = None,
     ) -> Tuple[float, float, float] | None:
         same_lane_waypoints, waypoint_by_xy = self._final_destination_lane_waypoints(
             lane_center_waypoints=lane_center_waypoints,
@@ -221,27 +375,46 @@ class RollingGoalScenario:
             ),
         )
 
-        traversed_waypoints: List[Mapping[str, object]] = [current_waypoint]
-        visited_keys = {
-            self._waypoint_key(
-                float(self._position_of_waypoint(current_waypoint)[0]),
-                float(self._position_of_waypoint(current_waypoint)[1]),
+        lookahead_distance_m: float | None = None
+        if bool((dynamic_lookahead_cfg or {}).get("enabled", False)):
+            min_distance_m = max(
+                0.0,
+                float((dynamic_lookahead_cfg or {}).get("min_distance_m", 0.0)),
             )
-        }
+            max_distance_m = max(
+                min_distance_m,
+                float((dynamic_lookahead_cfg or {}).get("max_distance_m", min_distance_m)),
+            )
+            speed_gain = float((dynamic_lookahead_cfg or {}).get("speed_gain", 0.0))
+            curvature_gain = float((dynamic_lookahead_cfg or {}).get("curvature_gain", 0.0))
+            sample_spacing_m = max(
+                0.1,
+                float((dynamic_lookahead_cfg or {}).get("curvature_sample_spacing_m", 5.0)),
+            )
 
-        for _ in range(max(0, int(lookahead_waypoint_count))):
-            next_position_raw = current_waypoint.get("next", None)
-            if not isinstance(next_position_raw, (list, tuple)) or len(next_position_raw) < 2:
-                break
-            next_key = self._waypoint_key(float(next_position_raw[0]), float(next_position_raw[1]))
-            if next_key in visited_keys:
-                break
-            next_waypoint = waypoint_by_xy.get(next_key)
-            if next_waypoint is None:
-                break
-            traversed_waypoints.append(next_waypoint)
-            visited_keys.add(next_key)
-            current_waypoint = next_waypoint
+            local_curvature = self._estimate_path_curvature(
+                start_waypoint=current_waypoint,
+                waypoint_by_xy=waypoint_by_xy,
+                origin_xy=(float(ego_x_m), float(ego_y_m)),
+                sample_spacing_m=sample_spacing_m,
+            )
+            raw_lookahead_distance_m = (
+                min_distance_m
+                + speed_gain * max(0.0, float(ego_speed_mps))
+                - curvature_gain * abs(local_curvature)
+            )
+            lookahead_distance_m = min(
+                max_distance_m,
+                max(min_distance_m, raw_lookahead_distance_m),
+            )
+
+        traversed_waypoints = self._follow_waypoint_chain(
+            start_waypoint=current_waypoint,
+            waypoint_by_xy=waypoint_by_xy,
+            max_distance_m=lookahead_distance_m,
+            max_waypoint_steps=None if lookahead_distance_m is not None else max(0, int(lookahead_waypoint_count)),
+            origin_xy=(float(ego_x_m), float(ego_y_m)),
+        )
 
         for waypoint in reversed(traversed_waypoints):
             current_position = self._position_of_waypoint(waypoint)
@@ -269,7 +442,9 @@ class RollingGoalScenario:
 
         _ = float(simulation_time_s)
         cfg = self.get_config()
-        mpc_goal_cfg = dict(cfg.get("mpc", {}).get("local_goal", {}))
+        runtime_local_goal_cfg = dict(self._runtime_local_goal_cfg)
+        scenario_local_goal_cfg = dict(cfg.get("mpc", {}).get("local_goal", {}))
+        mpc_goal_cfg = {**runtime_local_goal_cfg, **scenario_local_goal_cfg}
         legacy_local_goal_cfg = dict(cfg.get("local_goal", {}))
         shared_lookahead_waypoint_count = (
             int(self._runtime_lookahead_waypoint_count)
@@ -292,9 +467,26 @@ class RollingGoalScenario:
             0.0,
             float(mpc_goal_cfg.get("v_ref_mps", legacy_local_goal_cfg.get("v_ref_mps", 10.0))),
         )
+        dynamic_lookahead_cfg = {
+            "enabled": bool(mpc_goal_cfg.get("dynamic_lookahead_enabled", False)),
+            "min_distance_m": max(0.0, float(mpc_goal_cfg.get("dynamic_lookahead_min_distance_m", 0.0))),
+            "max_distance_m": max(0.0, float(mpc_goal_cfg.get("dynamic_lookahead_max_distance_m", 0.0))),
+            "speed_gain": float(mpc_goal_cfg.get("dynamic_lookahead_speed_gain", 0.0)),
+            "curvature_gain": float(mpc_goal_cfg.get("dynamic_lookahead_curvature_gain", 0.0)),
+            "curvature_sample_spacing_m": max(
+                0.1,
+                float(mpc_goal_cfg.get("dynamic_lookahead_curvature_sample_spacing_m", 5.0)),
+            ),
+        }
 
         x_ego_m = float(ego_snapshot.get("x", 0.0))
         y_ego_m = float(ego_snapshot.get("y", 0.0))
+        ego_speed_mps = float(
+            ego_snapshot.get(
+                "v",
+                (ego_snapshot.get("current_state", [0.0, 0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0, 0.0])[2],
+            )
+        )
         ego_psi_rad = float(ego_snapshot.get("psi", 0.0))
         x_final_m = float(final_destination_state[0])
         y_final_m = float(final_destination_state[1])
@@ -334,7 +526,25 @@ class RollingGoalScenario:
             final_destination_state=list(final_destination_state),
             lookahead_waypoint_count=lookahead_waypoint_count,
             obstacle_snapshots=list(obstacle_snapshots),
+            ego_speed_mps=ego_speed_mps,
+            dynamic_lookahead_cfg=dynamic_lookahead_cfg,
         )
+        if waypoint_target is None:
+            # Keep the temporary destination ahead of the ego even when the
+            # obstacle-aware target selection cannot find an unblocked forward
+            # waypoint. In that case, fall back to the same lookahead search
+            # without waypoint blocking so the local goal does not collapse
+            # onto the ego position at low speed.
+            waypoint_target = self._select_local_waypoint_target(
+                lane_center_waypoints=lane_center_waypoints,
+                ego_x_m=x_ego_m,
+                ego_y_m=y_ego_m,
+                final_destination_state=list(final_destination_state),
+                lookahead_waypoint_count=lookahead_waypoint_count,
+                obstacle_snapshots=[],
+                ego_speed_mps=ego_speed_mps,
+                dynamic_lookahead_cfg=dynamic_lookahead_cfg,
+            )
         if waypoint_target is None:
             return [x_ego_m, y_ego_m, 0.0, float(ego_psi_rad)]
 

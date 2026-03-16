@@ -1,4 +1,4 @@
-# MPC for Path Planning (test branch 1)
+# MPC for Path Planning
 
 This project simulates an ego vehicle that plans a future trajectory with linear time-varying MPC and then tracks that planned trajectory with a PID controller in `pygame`.
 
@@ -14,6 +14,38 @@ The runtime path is:
 8. Render the scene and save plots at the end.
 
 `super_ellipsoid.py` is kept as a reference/analysis script. The live obstacle potential used by MPC is implemented inside `MPC/mpc.py`, but it follows the same super-ellipsoid idea.
+
+## Major Updates In The Current Project
+
+- Added a new `behavior_planner/` package for high-level LLM-based lane-choice decisions.
+- Added prompt generation from live scenario data:
+  - prompt id
+  - ego state
+  - route safety flags
+  - previous decision
+  - surrounding-vehicle summaries with predicted intentions
+- Added OpenAI API integration for the behavior planner:
+  - separate behavior-planner loop in `main.py`
+  - configurable frequency in `MPC/mpc.yaml`
+  - `.env` / `OPENAI_API_KEY` support
+  - request/response id matching so only the correct response is applied
+- Added hardcoded runtime behavior-execution logic in code, independent of the text rules file.
+- Added dynamic lookahead distance for the rolling temporary destination:
+  - curvature-aware lookahead formula
+  - hard minimum distance so the temporary target stays ahead of the ego
+  - optional extra behavior-planner destination buffer
+- Updated temporary-destination behavior so:
+  - distance comes from the rolling-goal lookahead logic
+  - lane is selected by the behavior planner
+  - repeated same-direction lane-change outputs continue the same maneuver instead of requesting another extra lane jump
+- Removed the old scenario-local temporary-destination lane-switch logic. Lane selection is now shared behavior-planner logic rather than per-scenario hardcoded overrides.
+- Replaced the older obstacle-cost description with the current live super-ellipsoid exponential safe/collision potential used by MPC.
+- Added field-size limits for the repulsive potential:
+  - longitudinal cap with `max_longitudinal_zone_length_m`
+  - lateral cap with `limit_lateral_zone_to_lane_width` and `max_lateral_zone_lane_fraction`
+- Added potential-field visualization support in the `pygame` window.
+- Added behavior-planner / route / decision debug information to the HUD.
+- Added helper scripts for prompt/API latency checks and potential-field cost visualization.
 
 ## Installation
 
@@ -33,6 +65,14 @@ conda activate mpc_custom
 pip install -r requirements.txt
 ```
 
+If you want the behavior planner to call the OpenAI API, add a project-local `.env` file:
+
+```env
+OPENAI_API_KEY=your_api_key_here
+```
+
+`.env` is ignored by git.
+
 ## Running The Project
 
 Run a scenario from the project root:
@@ -44,6 +84,14 @@ python main.py red_light_violation_warning
 python main.py red_light_violation_warning_2
 python main.py workzone
 python main.py "workzone with bp"
+```
+
+If you do not want the LLM loop during a run, set:
+
+```yaml
+mpc:
+  behavior_planner_runtime:
+    enabled: false
 ```
 
 General form:
@@ -68,7 +116,13 @@ Available runtime scenarios in this workspace:
 - `MPC/mpc.py`
   Live LTV-MPC implementation and obstacle potential cost.
 - `MPC/mpc.yaml`
-  Default MPC/planner configuration.
+  Default MPC, rolling-goal, behavior-planner, and solver configuration.
+- `behavior_planner/`
+  Prompt creation, A* route support, intention inference, OpenAI API client, and behavior-execution logic.
+- `behavior_planner/system_instruction.txt`
+  The system instruction sent once to the LLM before prompt updates begin.
+- `behavior_planner/behavior_planner_rules.txt`
+  Human-readable rule document; the runtime logic is implemented directly in code.
 - `utility/pid_controller.py`
   PID tracker that follows the MPC state trajectory.
 - `utility/tracker.py`
@@ -78,11 +132,13 @@ Available runtime scenarios in this workspace:
 - `vehicle_manager/vehicle.py`
   Kinematic vehicle model used by ego and non-ego objects.
 - `scenarios/`
-  Scenario-specific road, objects, and high-level behavior logic.
+  Scenario-specific road, destination, and object configuration.
 - `plot/plotter.py`
   End-of-run plot generation.
 - `super_ellipsoid.py`
   Standalone analysis/demo script for the super-ellipsoid safety field.
+- `test.py`
+  Standalone API test loop for repeated prompt/response latency checks.
 
 ## Kinematic Model
 
@@ -212,7 +268,71 @@ This lane-center reference is used for:
 - rollout guidance
 - lane-center-follow cost
 
-The scenario-level `lookahead_waypoint_count` does not build the full lane-center reference by itself. It only decides where the temporary destination is placed ahead of the ego. MPC then uses the lane waypoints around that destination lane to build its own per-stage reference.
+The scenario-level `lookahead_waypoint_count` does not build the full lane-center reference by itself. It only decides where the temporary destination is placed ahead of the ego when distance-based local-goal selection is not available. MPC then uses the lane waypoints around that destination lane to build its own per-stage reference.
+
+## Rolling Destination And Behavior Planner
+
+The active temporary destination used by MPC is now built in two layers:
+
+1. The rolling-goal layer selects how far ahead the target should be.
+2. The behavior planner selects which lane that temporary destination should lie on.
+
+### Dynamic lookahead
+
+The current distance-based lookahead uses:
+
+$$
+L_{raw} = d_{min} + k_v V - k_c |\kappa|
+$$
+
+$$
+L_d = clamp(L_{raw}, d_{min}, d_{max})
+$$
+
+with curvature estimated from three forward samples:
+
+$$
+\kappa = \frac{4A}{abc}
+$$
+
+The minimum lookahead distance is also used as a hard lower bound when the
+behavior planner rebuilds the temporary destination, so the temporary target
+does not collapse onto the ego at very low speed.
+
+### Behavior-planner lane selection
+
+When the behavior planner is enabled:
+
+- the distance to the temporary destination comes from the rolling-goal layer
+- the lane of the temporary destination comes from the latest accepted behavior-planner decision
+- repeated `LANE_CHANGE_LEFT` or `LANE_CHANGE_RIGHT` outputs continue the same maneuver rather than requesting another additional lane jump
+
+The current prompt sent to the LLM is compact and looks like:
+
+```text
+ID:[prompt_id]
+
+Ego01:[x,y,v,psi,Llane]
+
+ROUTE:[lane_safe_l,lane_safe_c,lane_safe_r]
+
+PREV:[behavior]
+
+V[id]:[x,y,v,psi,Llane,I]
+```
+
+The response format is:
+
+```json
+{"id":"PROMPT_ID","behavior":"BEHAVIOR_NAME"}
+```
+
+At runtime, `main.py`:
+
+- sends the system instruction once before the scenario starts
+- runs the behavior planner on a separate loop
+- can call the OpenAI API at the configured frequency
+- applies the latest valid matching-id response to update the temporary destination lane and speed overrides
 
 ## Potential Function
 
@@ -524,8 +644,10 @@ Main planner settings:
 
 - `horizon_s`, `plan_dt_s`, `trajectory_generation_frequency_hz`
   Horizon length, discretization, and replan cadence.
+- `behavior_planner_runtime.*`
+  Behavior-planner frequency, OpenAI API settings, lane-safety thresholds, and logging controls.
 - `local_goal.*`
-  Temporary-destination generation used by rolling-goal scenarios.
+  Temporary-destination generation used by rolling-goal scenarios, including dynamic lookahead and behavior-planner destination buffer.
 - `final_stop_speed_cap.*`
   Stop-goal speed limit near final destinations.
 - `reference_rollout.*`
@@ -598,8 +720,6 @@ Each scenario typically contains:
   straight/curved geometry and camera defaults
 - `destination`
   final destination state
-- `behavior_planner`
-  optional scenario-specific high-level logic
 - `mpc`
   scenario-specific overrides, usually `local_goal` and `constraints`
 - `tracker`
@@ -607,20 +727,24 @@ Each scenario typically contains:
 - `vehicles`
   ego and non-ego initial states, motion modes, and object geometry
 
+Scenario-local temporary-destination lane switching has been removed. The lane
+of the active temporary destination is now controlled by the shared
+behavior-planner runtime, not by per-scenario hardcoded lane-change logic.
+
 ## Active Scenarios
 
 - `scenario4`
-  Curved-road rolling-goal scenario.
+  Curved-road rolling-goal scenario used for general MPC and behavior-planner tests.
 - `VRU`
-  Curved-road scenario with fixed final destination on the ego lane.
+  Curved-road scenario with vulnerable-road-user style interactions.
 - `red_light_violation_warning`
-  Curved-road scenario with a traffic-light proxy and stop-before-light behavior.
+  Curved-road red-light proxy scenario.
 - `red_light_violation_warning_2`
-  Variant of the red-light scenario used for additional behavior and stability tests.
+  Variant of the red-light scenario used for additional behavior and stability tests, including non-ego spin-in-place behavior hooks.
 - `workzone`
-  Workzone scenario with behavior-planner destination reassignment.
+  Workzone scenario used heavily for behavior-planner lane-selection tests.
 - `workzone with bp`
-  Workzone variant with explicit behavior-planner lane switch.
+  Workzone variant kept for additional behavior-planner experiments.
 
 ## Dependencies
 
@@ -632,6 +756,7 @@ Current live dependencies are:
 - `scipy`
 - `osqp`
 - `pyyaml`
+- `openai`
 - `pygame`
 - `matplotlib`
 

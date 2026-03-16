@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Sequence
 import math
 import os
 import sys
+import threading
 import time
 import warnings
 
@@ -38,6 +39,14 @@ warnings.filterwarnings(
 import pygame
 
 from MPC import MPC
+from behavior_planner import (
+    AStarGlobalPlanner,
+    BehaviorPlannerAPIClient,
+    BehaviorPlannerPromptBuilder,
+    apply_behavior_planner_decision,
+    decision_from_mapping,
+    parse_behavior_planner_response,
+)
 from scenarios import load_scenario_by_name
 from plot import SimulationPlotter
 from state_manager import StateManager
@@ -250,6 +259,263 @@ def _destination_for_mpc(
     return [x_m, y_m, v_ref, psi_ref]
 
 
+def _behavior_planner_prompt_loop(
+    prompt_builder: BehaviorPlannerPromptBuilder,
+    api_client: BehaviorPlannerAPIClient | None,
+    shared_state: Dict[str, object],
+    state_lock: threading.Lock,
+    stop_event: threading.Event,
+    frequency_hz: float,
+    response_deadline_s: float,
+    print_system_instruction: bool,
+    print_prompt: bool,
+    print_response: bool,
+) -> None:
+    """
+    Background loop that builds and prints the behavior-planner prompt.
+
+    The prompt loop runs independently from the simulation loop so the future
+    LLM behavior planner can operate at its own cadence.
+    """
+
+    period_s = 1.0 / max(1e-3, float(frequency_hz))
+    next_tick_s = time.perf_counter()
+    system_instruction_sent = False
+    system_instruction_text = ""
+    last_runtime_warning = ""
+
+    while not stop_event.is_set():
+        current_perf_s = time.perf_counter()
+        with state_lock:
+            ego_snapshot = dict(shared_state.get("ego_snapshot", {}))
+            destination_state = list(shared_state.get("destination_state", []))
+            temporary_destination_state = list(shared_state.get("temporary_destination_state", []))
+            lane_center_waypoints = [dict(item) for item in list(shared_state.get("lane_center_waypoints", []))]
+            object_snapshots = [dict(item) for item in list(shared_state.get("object_snapshots", []))]
+            road_cfg = dict(shared_state.get("road_cfg", {}))
+            behavior_planner_runtime_cfg = dict(shared_state.get("behavior_planner_runtime_cfg", {}))
+            mpc_constraints = dict(shared_state.get("mpc_constraints", {}))
+            v2x_broadcasts = [dict(item) for item in list(shared_state.get("v2x_broadcasts", []))]
+            simulation_time_s = float(shared_state.get("simulation_time_s", 0.0))
+            previous_behavior = str(
+                dict(shared_state.get("latest_behavior_decision", {})).get("behavior", "LANE_KEEP")
+            ).strip().upper() or "LANE_KEEP"
+            in_flight_request_seq = int(shared_state.get("in_flight_request_seq", -1))
+            in_flight_request_start_perf_s = float(
+                shared_state.get("in_flight_request_start_perf_s", 0.0)
+            )
+
+        if not system_instruction_sent:
+            try:
+                system_instruction_text = prompt_builder.load_system_instruction()
+                if bool(print_system_instruction):
+                    print("\n[BEHAVIOR PLANNER SYSTEM INSTRUCTION]")
+                    print(system_instruction_text)
+                system_instruction_sent = True
+            except Exception as prompt_exc:
+                warning_text = f"[WARN] Behavior-planner system instruction generation failed: {prompt_exc}"
+                if warning_text != last_runtime_warning:
+                    print(warning_text)
+                    last_runtime_warning = warning_text
+
+        if (
+            in_flight_request_seq >= 0
+            and in_flight_request_start_perf_s > 0.0
+            and (current_perf_s - in_flight_request_start_perf_s) >= float(response_deadline_s)
+        ):
+            with state_lock:
+                current_in_flight_seq = int(shared_state.get("in_flight_request_seq", -1))
+                if current_in_flight_seq == int(in_flight_request_seq):
+                    shared_state["in_flight_request_seq"] = -1
+                    shared_state["in_flight_request_start_perf_s"] = 0.0
+            timeout_warning = (
+                f"[WARN] Behavior-planner API request seq={in_flight_request_seq} exceeded "
+                f"{float(response_deadline_s):.2f}s and was ignored."
+            )
+            print(timeout_warning)
+            last_runtime_warning = timeout_warning
+
+        if len(ego_snapshot) > 0 and len(destination_state) >= 2 and len(lane_center_waypoints) > 0:
+            try:
+                if api_client is not None and bool(api_client.enabled):
+                    with state_lock:
+                        current_in_flight_seq = int(shared_state.get("in_flight_request_seq", -1))
+                        can_dispatch_request = current_in_flight_seq < 0
+                        request_seq = -1
+                        request_start_perf_s = 0.0
+                        if can_dispatch_request:
+                            request_seq = int(shared_state.get("behavior_request_seq", 0)) + 1
+                            request_start_perf_s = time.perf_counter()
+                            shared_state["behavior_request_seq"] = int(request_seq)
+                    if can_dispatch_request:
+                        prompt = prompt_builder.build_prompt(
+                            ego_snapshot=ego_snapshot,
+                            destination_state=destination_state,
+                            temporary_destination_state=temporary_destination_state,
+                            lane_center_waypoints=lane_center_waypoints,
+                            object_snapshots=object_snapshots,
+                            road_cfg=road_cfg,
+                            behavior_planner_runtime_cfg=behavior_planner_runtime_cfg,
+                            v2x_broadcasts=v2x_broadcasts,
+                            ego_vehicle_id="Ego01",
+                            mpc_constraints=mpc_constraints,
+                            prompt_id=request_seq,
+                            previous_behavior=previous_behavior,
+                        )
+                        with state_lock:
+                            shared_state["latest_behavior_prompt"] = str(prompt)
+                            shared_state["latest_behavior_prompt_time_s"] = float(simulation_time_s)
+                            shared_state["in_flight_request_seq"] = int(request_seq)
+                            shared_state["in_flight_request_start_perf_s"] = float(request_start_perf_s)
+                        if bool(print_prompt):
+                            print("\n[BEHAVIOR PLANNER INPUT]")
+                            print(f"[BEHAVIOR PLANNER INPUT] t={simulation_time_s:.2f}s seq={request_seq}")
+                            print(prompt)
+                        request_thread = threading.Thread(
+                            target=_behavior_planner_api_request_worker,
+                            kwargs={
+                                "api_client": api_client,
+                                "system_instruction": system_instruction_text,
+                                "prompt": prompt,
+                                "prompt_time_s": float(simulation_time_s),
+                                "request_seq": int(request_seq),
+                                "request_start_perf_s": float(request_start_perf_s),
+                                "shared_state": shared_state,
+                                "state_lock": state_lock,
+                                "print_response": bool(print_response),
+                            },
+                            name=f"behavior-planner-api-{request_seq}",
+                            daemon=True,
+                        )
+                        request_thread.start()
+                elif bool(print_prompt):
+                    prompt = prompt_builder.build_prompt(
+                        ego_snapshot=ego_snapshot,
+                        destination_state=destination_state,
+                        temporary_destination_state=temporary_destination_state,
+                        lane_center_waypoints=lane_center_waypoints,
+                        object_snapshots=object_snapshots,
+                        road_cfg=road_cfg,
+                        behavior_planner_runtime_cfg=behavior_planner_runtime_cfg,
+                        v2x_broadcasts=v2x_broadcasts,
+                        ego_vehicle_id="Ego01",
+                        mpc_constraints=mpc_constraints,
+                        previous_behavior=previous_behavior,
+                    )
+                    print("\n[BEHAVIOR PLANNER INPUT]")
+                    print(f"[BEHAVIOR PLANNER INPUT] t={simulation_time_s:.2f}s")
+                    print(prompt)
+                last_runtime_warning = ""
+            except Exception as prompt_exc:
+                warning_text = f"[WARN] Behavior-planner prompt generation failed: {prompt_exc}"
+                if warning_text != last_runtime_warning:
+                    print(warning_text)
+                    last_runtime_warning = warning_text
+
+        next_tick_s += period_s
+        wait_s = max(0.0, next_tick_s - time.perf_counter())
+        if stop_event.wait(wait_s):
+            break
+
+
+def _behavior_planner_api_request_worker(
+    api_client: BehaviorPlannerAPIClient,
+    system_instruction: str,
+    prompt: str,
+    prompt_time_s: float,
+    request_seq: int,
+    request_start_perf_s: float,
+    shared_state: Dict[str, object],
+    state_lock: threading.Lock,
+    print_response: bool,
+) -> None:
+    """Send one non-blocking behavior-planner API request and cache the result."""
+
+    try:
+        response_text, response_id = api_client.request_decision(
+            system_instruction=system_instruction,
+            prompt=prompt,
+        )
+        response_latency_s = max(0.0, time.perf_counter() - float(request_start_perf_s))
+        decision = parse_behavior_planner_response(response_text)
+        expected_request_id = str(request_seq)
+        if str(decision.request_id).strip() != expected_request_id:
+            with state_lock:
+                current_in_flight_seq = int(shared_state.get("in_flight_request_seq", -1))
+                if int(request_seq) == current_in_flight_seq:
+                    shared_state["in_flight_request_seq"] = -1
+                    shared_state["in_flight_request_start_perf_s"] = 0.0
+            print(
+                f"[WARN] Behavior-planner response id mismatch: expected={expected_request_id} "
+                f"received={decision.request_id!r}"
+            )
+            return
+        should_update = False
+        was_ignored = False
+        with state_lock:
+            current_in_flight_seq = int(shared_state.get("in_flight_request_seq", -1))
+            latest_response_seq = int(shared_state.get("latest_behavior_decision_seq", -1))
+            if int(request_seq) == current_in_flight_seq and int(request_seq) >= latest_response_seq:
+                shared_state["latest_behavior_decision"] = dict(decision.to_dict())
+                shared_state["latest_behavior_response_text"] = str(response_text)
+                shared_state["latest_behavior_response_id"] = response_id
+                shared_state["latest_behavior_decision_time_s"] = float(prompt_time_s)
+                shared_state["latest_behavior_decision_seq"] = int(request_seq)
+                shared_state["latest_behavior_response_latency_s"] = float(response_latency_s)
+                shared_state["in_flight_request_seq"] = -1
+                shared_state["in_flight_request_start_perf_s"] = 0.0
+                should_update = True
+            else:
+                was_ignored = True
+        if should_update and bool(print_response):
+            print("\n[BEHAVIOR PLANNER RESPONSE]")
+            print(
+                f"[BEHAVIOR PLANNER RESPONSE] t={prompt_time_s:.2f}s seq={request_seq} "
+                f"latency={response_latency_s:.3f}s"
+            )
+            print(response_text)
+        elif was_ignored and bool(print_response):
+            print(
+                f"[BEHAVIOR PLANNER RESPONSE IGNORED] seq={request_seq} "
+                f"latency={response_latency_s:.3f}s"
+            )
+    except Exception as response_exc:
+        should_warn = False
+        with state_lock:
+            current_in_flight_seq = int(shared_state.get("in_flight_request_seq", -1))
+            if int(request_seq) == current_in_flight_seq:
+                shared_state["in_flight_request_seq"] = -1
+                shared_state["in_flight_request_start_perf_s"] = 0.0
+                should_warn = True
+        if should_warn:
+            print(f"[WARN] Behavior-planner API request failed: {response_exc}")
+
+
+def _prime_behavior_planner_system_instruction_before_start(
+    prompt_builder: BehaviorPlannerPromptBuilder,
+    api_client: BehaviorPlannerAPIClient | None,
+    print_system_instruction: bool,
+) -> None:
+    """
+    Send only the system instruction synchronously before simulation time starts
+    so the initial setup latency does not affect the first live prompt.
+    """
+
+    if api_client is None or not bool(api_client.enabled):
+        return
+
+    system_instruction_text = prompt_builder.load_system_instruction()
+    start_perf_s = time.perf_counter()
+    response_id = api_client.prime_system_instruction(system_instruction=system_instruction_text)
+    response_latency_s = max(0.0, time.perf_counter() - start_perf_s)
+    if bool(print_system_instruction):
+        print("\n[BEHAVIOR PLANNER SYSTEM INSTRUCTION SENT]")
+        print(
+            "[BEHAVIOR PLANNER SYSTEM INSTRUCTION SENT] "
+            f"latency={response_latency_s:.3f}s response_id={response_id}"
+        )
+
+
 def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario_name: str = "scenario") -> None:
     """
     Intent:
@@ -267,10 +533,14 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
     pid_controller_cfg = dict(config.get("pid_controller", {}))
     state_manager_cfg = dict(config.get("state_manager", {}))
     vehicle_manager_cfg = dict(config.get("vehicle_manager", {}))
-    set_runtime_lookahead_fn = getattr(scenario_handler, "set_runtime_lookahead_waypoint_count", None)
-    if callable(set_runtime_lookahead_fn):
-        shared_local_goal_cfg = dict(mpc_cfg.get("local_goal", {}))
-        set_runtime_lookahead_fn(shared_local_goal_cfg.get("lookahead_waypoint_count", None))
+    shared_local_goal_cfg = dict(mpc_cfg.get("local_goal", {}))
+    set_runtime_local_goal_cfg_fn = getattr(scenario_handler, "set_runtime_local_goal_config", None)
+    if callable(set_runtime_local_goal_cfg_fn):
+        set_runtime_local_goal_cfg_fn(shared_local_goal_cfg)
+    else:
+        set_runtime_lookahead_fn = getattr(scenario_handler, "set_runtime_lookahead_waypoint_count", None)
+        if callable(set_runtime_lookahead_fn):
+            set_runtime_lookahead_fn(shared_local_goal_cfg.get("lookahead_waypoint_count", None))
 
     # Enforce the PDF timing requirement: simulation dt = 0.05 s and MPC uses
     # the same discretization, while planning frequency is a separate variable.
@@ -314,7 +584,9 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
         0.0,
         float(scenario_start_delay_s if scenario_start_delay_s is not None else mpc_cfg.get("delay", 0.0)),
     )
-    target_fps = max(1, int(sim_cfg.get("target_fps", 60)))
+    # Keep simulation time approximately aligned with wall-clock time by
+    # capping the render/update loop at 1 / dt.
+    target_fps = max(1, int(round(1.0 / max(1e-9, float(sim_dt_s)))))
 
     vehicles = build_vehicles_from_config(config=config, vehicle_manager_cfg=vehicle_manager_cfg)
     ego_vehicle = find_ego_vehicle(vehicles)
@@ -369,6 +641,14 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
     )
     plot_cost_enabled = bool(mpc_cfg.get("plot_cost", True))
     plot_properties_enabled = bool(mpc_cfg.get("plot_properties", True))
+    repulsive_cost_distance_plot_cfg = dict(sim_cfg.get("repulsive_cost_distance_plot", {}))
+    repulsive_cost_distance_plot_enabled = bool(repulsive_cost_distance_plot_cfg.get("enabled", False))
+    repulsive_cost_distance_plot_vehicle_id = str(
+        repulsive_cost_distance_plot_cfg.get("tracked_vehicle_id", "")
+    ).strip()
+    repulsive_cost_distance_truncate_at_min_distance = bool(
+        repulsive_cost_distance_plot_cfg.get("truncate_at_min_distance", True)
+    )
     planned_profile_plot_cfg = dict(mpc_cfg.get("planned_profile_plot", mpc_cfg.get("planned_control_dump", {})))
     planned_profile_plot_enabled = bool(planned_profile_plot_cfg.get("enabled", True)) and bool(plot_properties_enabled)
     planned_profile_steps = max(1, int(planned_profile_plot_cfg.get("steps_to_plot", planned_profile_plot_cfg.get("steps_to_save", 5))))
@@ -394,8 +674,115 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
     mpc_planned_steer_by_step: List[List[float]] = [[] for _ in range(planned_profile_steps)]
     mpc_planned_velocity_by_step: List[List[float]] = [[] for _ in range(planned_profile_steps)]
     mpc_planned_psi_by_step: List[List[float]] = [[] for _ in range(planned_profile_steps)]
+    repulsive_cost_distance_log_m: List[float] = []
+    repulsive_cost_safe_log: List[float] = []
+    repulsive_cost_collision_log: List[float] = []
+    repulsive_cost_total_log: List[float] = []
     generated_plot_paths: List[str] = []
     seen_non_ego_vehicle_ids: set[str] = set()
+    behavior_planner_runtime_cfg = dict(mpc_cfg.get("behavior_planner_runtime", {}))
+    behavior_planner_prompt_enabled = bool(behavior_planner_runtime_cfg.get("enabled", True))
+    behavior_planner_prompt_frequency_hz = max(
+        1e-3,
+        float(behavior_planner_runtime_cfg.get("frequency_hz", 2.0)),
+    )
+    behavior_planner_response_deadline_s = max(
+        0.1,
+        float(behavior_planner_runtime_cfg.get("response_deadline_s", 1.0)),
+    )
+    behavior_planner_prompt_builder = BehaviorPlannerPromptBuilder() if behavior_planner_prompt_enabled else None
+    behavior_planner_api_client = None
+    if behavior_planner_prompt_enabled:
+        behavior_planner_api_client = BehaviorPlannerAPIClient(
+            api_key_env_var=str(
+                behavior_planner_runtime_cfg.get("api_key_env_var", "OPENAI_API_KEY")
+            ),
+            model=str(behavior_planner_runtime_cfg.get("model", "gpt-4o")),
+            temperature=float(behavior_planner_runtime_cfg.get("temperature", 0.0)),
+            request_timeout_s=float(
+                min(
+                    float(behavior_planner_runtime_cfg.get("request_timeout_s", 30.0)),
+                    float(behavior_planner_response_deadline_s),
+                )
+            ),
+            max_output_tokens=int(behavior_planner_runtime_cfg.get("max_output_tokens", 300)),
+            enabled=bool(behavior_planner_runtime_cfg.get("api_enabled", True)),
+        )
+    behavior_planner_state_lock = threading.Lock()
+    behavior_planner_stop_event = threading.Event()
+    behavior_planner_thread = None
+    behavior_planner_shared_state: Dict[str, object] = {
+        "ego_snapshot": {},
+        "destination_state": list(destination_state),
+        "lane_center_waypoints": [],
+        "object_snapshots": [],
+        "road_cfg": dict(road_cfg),
+        "behavior_planner_runtime_cfg": dict(behavior_planner_runtime_cfg),
+        "mpc_constraints": dict(mpc_cfg.get("constraints", {})),
+        "v2x_broadcasts": [],
+        "simulation_time_s": 0.0,
+        "latest_behavior_decision": {"behavior": "LANE_KEEP"},
+        "latest_behavior_response_text": "",
+        "latest_behavior_response_id": None,
+        "latest_behavior_response_latency_s": 0.0,
+        "latest_behavior_prompt": "",
+        "latest_behavior_prompt_time_s": 0.0,
+        "latest_behavior_decision_time_s": 0.0,
+        "latest_behavior_decision_seq": -1,
+        "behavior_request_seq": 0,
+        "in_flight_request_seq": -1,
+        "in_flight_request_start_perf_s": 0.0,
+    }
+    last_applied_behavior_decision_seq = -1
+    current_applied_behavior = "LANE_KEEP"
+    saved_max_velocity_before_emergency_mps: float | None = None
+    selected_destination_lane_id: int | None = None
+
+    if behavior_planner_prompt_builder is not None:
+        # Build the initial road/vehicle snapshot so the first behavior-planner
+        # request can complete before simulation time starts.
+        scenario_handler.draw_road(
+            surface=screen,
+            road_cfg=road_cfg,
+            camera_center_world=camera_center_world,
+            pixels_per_meter=pixels_per_meter,
+            world_to_screen_fn=None,
+        )
+        initial_lane_center_waypoints = list(scenario_handler.get_latest_lane_waypoints())
+        initial_ego_snapshot = ego_vehicle.to_snapshot()
+        initial_object_snapshots = [
+            vehicle.to_snapshot()
+            for vehicle in vehicles
+            if str(vehicle.vehicle_type).lower() != "ego"
+        ]
+        with behavior_planner_state_lock:
+            behavior_planner_shared_state["ego_snapshot"] = dict(initial_ego_snapshot)
+            behavior_planner_shared_state["destination_state"] = list(final_destination_state)
+            behavior_planner_shared_state["temporary_destination_state"] = list(destination_state)
+            behavior_planner_shared_state["lane_center_waypoints"] = [
+                dict(item) for item in initial_lane_center_waypoints
+            ]
+            behavior_planner_shared_state["object_snapshots"] = [
+                dict(item) for item in initial_object_snapshots
+            ]
+        if len(initial_lane_center_waypoints) > 0:
+            initial_lane_context = AStarGlobalPlanner(
+                lane_center_waypoints=initial_lane_center_waypoints
+            ).get_local_lane_context(
+                x_m=float(initial_ego_snapshot.get("x", 0.0)),
+                y_m=float(initial_ego_snapshot.get("y", 0.0)),
+                heading_rad=float(initial_ego_snapshot.get("psi", 0.0)),
+            )
+            initial_selected_lane_id = int(initial_lane_context.get("lane_id", 1))
+            selected_destination_lane_id = max(1, int(initial_selected_lane_id))
+
+        _prime_behavior_planner_system_instruction_before_start(
+            prompt_builder=behavior_planner_prompt_builder,
+            api_client=behavior_planner_api_client,
+            print_system_instruction=bool(
+                behavior_planner_runtime_cfg.get("print_system_instruction", True)
+            ),
+        )
 
     running = True
     try:
@@ -411,6 +798,26 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                 draw_hud_text(screen, font, [f"Simulation starts in {max(0.0, startup_delay_s - (time.perf_counter() - start_wall_s)):.1f}s"], (16, 14))
                 pygame.display.flip()
                 clock.tick(target_fps)
+
+        if behavior_planner_prompt_builder is not None:
+            behavior_planner_thread = threading.Thread(
+                target=_behavior_planner_prompt_loop,
+                kwargs={
+                    "prompt_builder": behavior_planner_prompt_builder,
+                    "api_client": behavior_planner_api_client,
+                    "shared_state": behavior_planner_shared_state,
+                    "state_lock": behavior_planner_state_lock,
+                    "stop_event": behavior_planner_stop_event,
+                    "frequency_hz": behavior_planner_prompt_frequency_hz,
+                    "response_deadline_s": behavior_planner_response_deadline_s,
+                    "print_system_instruction": bool(behavior_planner_runtime_cfg.get("print_system_instruction", True)),
+                    "print_prompt": bool(behavior_planner_runtime_cfg.get("print_prompt", True)),
+                    "print_response": bool(behavior_planner_runtime_cfg.get("print_response", True)),
+                },
+                name="behavior-planner-prompt-thread",
+                daemon=True,
+            )
+            behavior_planner_thread.start()
 
         while running:
             for event in pygame.event.get():
@@ -481,6 +888,17 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                 snapshot["future_trajectory"] = [list(state) for state in future_states]
                 snapshot["predicted_trajectory"] = [list(state) for state in future_states]
 
+            behavior_lane_waypoints = list(lane_center_waypoints)
+            if len(behavior_lane_waypoints) == 0 and hasattr(scenario_handler, "get_latest_lane_waypoints"):
+                behavior_lane_waypoints = list(scenario_handler.get_latest_lane_waypoints())
+            with behavior_planner_state_lock:
+                behavior_planner_shared_state["ego_snapshot"] = dict(ego_snapshot)
+                behavior_planner_shared_state["destination_state"] = list(final_destination_state)
+                behavior_planner_shared_state["temporary_destination_state"] = list(destination_state)
+                behavior_planner_shared_state["lane_center_waypoints"] = [dict(item) for item in behavior_lane_waypoints]
+                behavior_planner_shared_state["object_snapshots"] = [dict(item) for item in object_snapshots]
+                behavior_planner_shared_state["simulation_time_s"] = float(simulation_time_s)
+
             # Scenario-specific behavior planner hook (optional):
             # allow scenario to update final destination online.
             final_destination_fn = getattr(scenario_handler, "get_final_destination_state", None)
@@ -533,12 +951,23 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
             goal_distance_m = math.hypot(goal_dx, goal_dy)
             ego_reached_goal = goal_distance_m <= destination_reached_threshold_m
 
+            latest_behavior_decision_seq = -1
+            if behavior_planner_prompt_enabled:
+                with behavior_planner_state_lock:
+                    latest_behavior_decision_seq = int(
+                        behavior_planner_shared_state.get("latest_behavior_decision_seq", -1)
+                    )
+            behavior_replan_pending = bool(
+                latest_behavior_decision_seq > int(last_applied_behavior_decision_seq)
+            )
+
             remaining_plan_points = max(0, len(planned_trajectory_states) - int(plan_cursor))
             need_replan = (
                 simulation_time_s + 1e-9 >= next_replan_time_s
                 or len(planned_trajectory_states) == 0
                 or plan_cursor >= len(planned_trajectory_states)
                 or (replan_buffer_steps > 0 and remaining_plan_points <= replan_buffer_steps)
+                or behavior_replan_pending
             )
             if need_replan:
                 # Keep the planner's configured base speed bound intact here.
@@ -569,6 +998,58 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                         destination_state = list(final_destination_state)
                 else:
                     destination_state = list(final_destination_state)
+
+                latest_behavior_decision = None
+                latest_behavior_decision_seq = -1
+                if behavior_planner_prompt_enabled:
+                    with behavior_planner_state_lock:
+                        latest_behavior_decision = decision_from_mapping(
+                            behavior_planner_shared_state.get("latest_behavior_decision", {})
+                        )
+                        latest_behavior_decision_seq = int(
+                            behavior_planner_shared_state.get("latest_behavior_decision_seq", -1)
+                        )
+
+                if latest_behavior_decision is not None:
+                    latest_behavior_name = str(latest_behavior_decision.behavior).strip().upper()
+                    if latest_behavior_name == "EMERGENCY_BRAKE":
+                        if saved_max_velocity_before_emergency_mps is None:
+                            saved_max_velocity_before_emergency_mps = float(
+                                mpc_planner.constraints.max_velocity_mps
+                            )
+                    elif saved_max_velocity_before_emergency_mps is not None:
+                        mpc_planner.constraints.max_velocity_mps = float(
+                            saved_max_velocity_before_emergency_mps
+                        )
+                        saved_max_velocity_before_emergency_mps = None
+
+                    behavior_execution = apply_behavior_planner_decision(
+                        decision=latest_behavior_decision,
+                        ego_snapshot=ego_snapshot,
+                        base_destination_state=destination_state,
+                        final_destination_state=final_destination_state,
+                        lane_center_waypoints=local_waypoints,
+                        selected_lane_id=selected_destination_lane_id,
+                        previous_applied_behavior=current_applied_behavior,
+                        road_cfg=road_cfg,
+                        local_goal_cfg=shared_local_goal_cfg,
+                        mpc_constraints={
+                            "max_velocity_mps": float(base_mpc_max_velocity_mps),
+                            "min_acceleration_mps2": float(mpc_planner.constraints.min_acceleration_mps2),
+                        },
+                    )
+                    destination_state = list(behavior_execution.destination_state)
+                    selected_destination_lane_id = int(behavior_execution.selected_lane_id)
+                    if behavior_execution.max_velocity_override_mps is not None:
+                        mpc_planner.constraints.max_velocity_mps = float(
+                            behavior_execution.max_velocity_override_mps
+                        )
+                    last_applied_behavior_decision_seq = int(latest_behavior_decision_seq)
+                    current_applied_behavior = str(behavior_execution.applied_behavior)
+
+                if behavior_planner_prompt_enabled:
+                    with behavior_planner_state_lock:
+                        behavior_planner_shared_state["temporary_destination_state"] = list(destination_state)
 
                 mpc_destination_input = _destination_for_mpc(
                     destination_state=destination_state,
@@ -642,6 +1123,34 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                     cost_log_time_s.append(float(simulation_time_s))
                     for cost_key in cost_log_terms.keys():
                         cost_log_terms[cost_key].append(float(latest_cost_terms.get(cost_key, 0.0)))
+                    if bool(repulsive_cost_distance_plot_enabled):
+                        tracked_snapshot = None
+                        if len(repulsive_cost_distance_plot_vehicle_id) > 0:
+                            tracked_snapshot = next(
+                                (
+                                    snapshot
+                                    for snapshot in object_snapshots
+                                    if str(snapshot.get("vehicle_id", "")) == repulsive_cost_distance_plot_vehicle_id
+                                ),
+                                None,
+                            )
+                        if tracked_snapshot is None and len(object_snapshots) > 0:
+                            tracked_snapshot = min(
+                                object_snapshots,
+                                key=lambda snapshot: math.hypot(
+                                    float(snapshot.get("x", 0.0)) - float(ego_snapshot.get("x", 0.0)),
+                                    float(snapshot.get("y", 0.0)) - float(ego_snapshot.get("y", 0.0)),
+                                ),
+                            )
+                        if tracked_snapshot is not None:
+                            distance_m = math.hypot(
+                                float(tracked_snapshot.get("x", 0.0)) - float(ego_snapshot.get("x", 0.0)),
+                                float(tracked_snapshot.get("y", 0.0)) - float(ego_snapshot.get("y", 0.0)),
+                            )
+                            repulsive_cost_distance_log_m.append(float(distance_m))
+                            repulsive_cost_safe_log.append(float(latest_cost_terms.get("Cost_Repulsive_Safe", 0.0)))
+                            repulsive_cost_collision_log.append(float(latest_cost_terms.get("Cost_Repulsive_Collision", 0.0)))
+                            repulsive_cost_total_log.append(float(latest_cost_terms.get("Cost_Repulsive", 0.0)))
                 if planned_profile_plot_enabled:
                     planned_controls = mpc_planner.get_last_control_sequence(max_steps=planned_profile_steps)
                     mpc_plan_log_x_m.append(float(ego_snapshot["x"]))
@@ -665,13 +1174,27 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
 
             # Track the planned trajectory with PID and move the ego through
             # the vehicle kinematic model for one simulation step.
-            plan_cursor = _track_ego_with_pid(
-                ego_vehicle=ego_vehicle,
-                trajectory_pid_controller=ego_trajectory_pid,
-                planned_states=planned_trajectory_states,
-                plan_cursor=plan_cursor,
-                sim_dt_s=float(sim_dt_s),
-            )
+            ego_control_override = None
+            ego_control_override_fn = getattr(scenario_handler, "get_ego_control_override", None)
+            if callable(ego_control_override_fn):
+                ego_control_override = ego_control_override_fn(
+                    ego_snapshot=ego_snapshot,
+                    destination_state=destination_state,
+                    final_destination_state=final_destination_state,
+                    simulation_time_s=simulation_time_s,
+                )
+
+            if isinstance(ego_control_override, Mapping) and bool(ego_control_override.get("freeze", False)):
+                ego_vehicle.current_state[2] = 0.0
+                ego_vehicle.set_control(0.0, 0.0)
+            else:
+                plan_cursor = _track_ego_with_pid(
+                    ego_vehicle=ego_vehicle,
+                    trajectory_pid_controller=ego_trajectory_pid,
+                    planned_states=planned_trajectory_states,
+                    plan_cursor=plan_cursor,
+                    sim_dt_s=float(sim_dt_s),
+                )
             ego_vehicle.set_future_trajectory(planned_trajectory_states[plan_cursor:])
 
             # Advance non-ego objects with simple scenario-defined motion modes.
@@ -716,6 +1239,18 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                     vehicle.current_state[2] = 0.0
                     vehicle.set_control(0.0, 0.0)
                     vehicle.step(sim_dt_s)
+                    continue
+
+                if control_override is not None and control_override.get("yaw_rate_rps", None) is not None:
+                    yaw_rate_rps = float(control_override.get("yaw_rate_rps", 0.0))
+                    x_m, y_m, _, psi_rad = [float(value) for value in vehicle.current_state]
+                    vehicle.current_state = [
+                        float(x_m),
+                        float(y_m),
+                        0.0,
+                        _wrap_angle(float(psi_rad) + yaw_rate_rps * float(sim_dt_s)),
+                    ]
+                    vehicle.set_control(0.0, 0.0)
                     continue
 
                 accel_cmd = None if control_override is None else control_override.get("acceleration_mps2")
@@ -874,21 +1409,100 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
 
             ego_state = list(ego_vehicle.current_state)
             runtime_status = mpc_planner.get_runtime_status()
+            lookahead_distance_m = 0.0
+            if len(destination_state) >= 2:
+                lookahead_distance_m = math.hypot(
+                    float(destination_state[0]) - float(ego_state[0]),
+                    float(destination_state[1]) - float(ego_state[1]),
+                )
             hud_lines = [
                 "ESC quit | LMB set destination (scenario1 only)",
                 f"time={simulation_time_s:6.2f}s  sim_dt={sim_dt_s:.2f}s  replan={planning_frequency_hz:.2f} Hz ({planning_period_s:.2f}s)",
                 f"ego state [x,y,v,psi]=[{ego_state[0]:.2f}, {ego_state[1]:.2f}, {ego_state[2]:.2f}, {ego_state[3]:.3f}]",
                 f"destination_final=[{float(final_destination_state[0]):.2f}, {float(final_destination_state[1]):.2f}]  destination_temp=[{float(destination_state[0]):.2f}, {float(destination_state[1]):.2f}]",
-                f"goal_dist={goal_distance_m:.2f}m  reached={ego_reached_goal}",
+                f"goal_dist={goal_distance_m:.2f}m  lookahead_dist={lookahead_distance_m:.2f}m  reached={ego_reached_goal}",
                 f"planner status={runtime_status['solver_status']}  solve={float(runtime_status['solve_time_ms']):.1f}ms  horizon={runtime_status['horizon_s']:.1f}s",
                 f"trajectory points total={len(planned_trajectory_states)} remaining={max(0, len(planned_trajectory_states)-plan_cursor)}",
                 f"objects={len(object_snapshots)}  predicted_paths={len(obstacle_prediction_by_id)}  lane_waypoints={len(lane_center_waypoints)}",
             ]
             draw_hud_text(screen, font, hud_lines, (16, 14))
 
+            route_display_line = "ROUTE:[pending]"
+            ego_display_line = (
+                f"Ego01:[{float(ego_state[0]):.3f},{float(ego_state[1]):.3f},"
+                f"{float(ego_state[2]):.3f},{float(ego_state[3]):.6f},?]"
+            )
+            temp_lane_display_line = "TEMP_LANE:[pending]"
+            lane_count_for_prompt = max(1, int(road_cfg.get("lane_count", 1)))
+            if len(lane_center_waypoints) > 0:
+                try:
+                    ego_lane_context = AStarGlobalPlanner(
+                        lane_center_waypoints
+                    ).get_local_lane_context(
+                        x_m=float(ego_state[0]),
+                        y_m=float(ego_state[1]),
+                        heading_rad=float(ego_state[3]),
+                    )
+                    ego_lane_raw = int(ego_lane_context.get("lane_id", -1))
+                    ego_lane_prompt = int(ego_lane_raw) - (lane_count_for_prompt + 1)
+                    ego_display_line = (
+                        f"Ego01:[{float(ego_state[0]):.3f},{float(ego_state[1]):.3f},"
+                        f"{float(ego_state[2]):.3f},{float(ego_state[3]):.6f},{int(ego_lane_prompt)}]"
+                    )
+                except Exception:
+                    pass
+            if behavior_planner_prompt_enabled:
+                with behavior_planner_state_lock:
+                    latest_prompt_text = str(behavior_planner_shared_state.get("latest_behavior_prompt", "")).strip()
+                if len(latest_prompt_text) > 0:
+                    route_display_line = next(
+                        (
+                            line.strip()
+                            for line in latest_prompt_text.splitlines()
+                            if str(line).strip().startswith("ROUTE:[")
+                        ),
+                        route_display_line,
+                    )
+            if len(destination_state) >= 2 and len(lane_center_waypoints) > 0:
+                try:
+                    temp_lane_context = AStarGlobalPlanner(
+                        lane_center_waypoints
+                    ).get_local_lane_context(
+                        x_m=float(destination_state[0]),
+                        y_m=float(destination_state[1]),
+                        heading_rad=float(destination_state[3]) if len(destination_state) >= 4 else 0.0,
+                    )
+                    temp_lane_raw = int(temp_lane_context.get("lane_id", -1))
+                    temp_lane_prompt = int(temp_lane_raw) - (lane_count_for_prompt + 1)
+                    if selected_destination_lane_id is None:
+                        temp_lane_display_line = f"TEMP_LANE:[{temp_lane_prompt}]"
+                    else:
+                        selected_lane_prompt = int(selected_destination_lane_id) - (lane_count_for_prompt + 1)
+                        temp_lane_display_line = (
+                            f"TEMP_LANE:[{temp_lane_prompt}]  SELECTED:[{selected_lane_prompt}]"
+                        )
+                except Exception:
+                    temp_lane_display_line = "TEMP_LANE:[error]"
+            route_decision_lines = [
+                ego_display_line,
+                route_display_line,
+                temp_lane_display_line,
+                f"DECISION:[{str(current_applied_behavior)}]",
+            ]
+            draw_hud_text(
+                screen,
+                font,
+                route_decision_lines,
+                (int(screen.get_width()) - 16, 14),
+                anchor="right",
+            )
+
             pygame.display.flip()
             clock.tick(target_fps)
     finally:
+        behavior_planner_stop_event.set()
+        if behavior_planner_thread is not None and behavior_planner_thread.is_alive():
+            behavior_planner_thread.join(timeout=1.0)
         try:
             generated_plot_paths.extend(
                 plotter.save_x_coordinate_plots(
@@ -914,6 +1528,17 @@ def run_simulation(config: Mapping[str, Any], scenario_handler: object, scenario
                         steer_by_step=mpc_planned_steer_by_step,
                         velocity_by_step=mpc_planned_velocity_by_step,
                         psi_by_step=mpc_planned_psi_by_step,
+                    )
+                )
+            if repulsive_cost_distance_plot_enabled:
+                generated_plot_paths.extend(
+                    plotter.save_repulsive_cost_vs_distance_plot(
+                        scenario_name=str(scenario_name),
+                        obstacle_distance_m=repulsive_cost_distance_log_m,
+                        repulsive_safe_cost=repulsive_cost_safe_log,
+                        repulsive_collision_cost=repulsive_cost_collision_log,
+                        repulsive_total_cost=repulsive_cost_total_log,
+                        truncate_at_min_distance=repulsive_cost_distance_truncate_at_min_distance,
                     )
                 )
 

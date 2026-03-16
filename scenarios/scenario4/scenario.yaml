@@ -2,7 +2,7 @@ simulation:
   dt_s: 0.05
   start_delay_s: 0
   target_fps: 60
-  visualization_horizon_s: 5.0
+  visualization_horizon_s: 3.0
   replan_buffer_steps: 50
   plot_width_scale: 0.6
   plot_height_scale: 2.4
@@ -121,18 +121,18 @@ vehicles:
   - 235
   - 150
   - 70
-- vehicle_id: obs_moving_2
-  type: surrounding_vehicle
-  initial_state:
-  - 60.0
-  - 5.49
-  - 7.0
-  - 0.0
-  motion_mode: lane_straight
-  wheelbase_m: 2.0
-  length_m: 4.5
-  width_m: 2.0
-  color_rgb:
-  - 235
-  - 180
-  - 90
+# - vehicle_id: obs_moving_2
+#   type: surrounding_vehicle
+#   initial_state:
+#   - 60.0
+#   - 5.49
+#   - 1.0
+#   - 0.0
+#   motion_mode: lane_straight
+#   wheelbase_m: 2.0
+#   length_m: 4.5
+#   width_m: 2.0
+#   color_rgb:
+#   - 235
+#   - 180
+#   - 90

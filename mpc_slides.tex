@@ -1,0 +1,367 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{setspace}
+
+\setstretch{1.08}
+
+\title{MPC Formulation and Current Parameters}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Objective Function}
+
+The current linear time-varying MPC problem is written as
+
+\begin{equation}
+\min_{\{X_k,U_k\}_{k=1}^{N}} J
+=
+J_{\mathrm{ref}}
++
+J_{\mathrm{lane}}
++
+J_{\mathrm{repulsive}}
++
+J_{\mathrm{control}}
+\end{equation}
+
+where the state and control are
+
+\begin{equation}
+X_k = [x_k,\; y_k,\; v_k,\; \psi_k]
+\end{equation}
+
+\begin{equation}
+U_k = [a_k,\; \delta_k].
+\end{equation}
+
+\subsection{Attractive Reference Cost}
+
+The destination-tracking term is
+
+\begin{equation}
+J_{\mathrm{ref}}
+=
+w_{\mathrm{att}}
+\sum_{k=1}^{N}
+\left[
+q_x (x_k-x_{\mathrm{ref}})^2
++
+q_y (y_k-y_{\mathrm{ref}})^2
++
+q_v (v_k-v_{\mathrm{ref}})^2
++
+q_{\psi}\big(\psi_k-\psi_{\mathrm{ref}}\big)^2
+\right].
+\end{equation}
+
+\subsection{Lane-Center Following Cost}
+
+The lane-center lateral error is
+
+\begin{equation}
+e_{y,k}
+=
+-
+\big(x_k-x^{\mathrm{lane}}_{\mathrm{ref},k}\big)
+\sin\theta^{\mathrm{lane}}_{\mathrm{ref},k}
++
+\big(y_k-y^{\mathrm{lane}}_{\mathrm{ref},k}\big)
+\cos\theta^{\mathrm{lane}}_{\mathrm{ref},k}.
+\end{equation}
+
+The stage-varying lane weight is
+
+\begin{equation}
+w_k = w_0 \alpha^{k-1}.
+\end{equation}
+
+The lane term is
+
+\begin{equation}
+J_{\mathrm{lane}}
+=
+\sum_{k=1}^{N}
+w_k
+\left[
+e_{y,k}^2
++
+q_{\psi,\mathrm{lane}}
+\big(\psi_k-\psi^{\mathrm{lane}}_{\mathrm{ref},k}\big)^2
+\right].
+\end{equation}
+
+\subsection{Control Smoothness Cost}
+
+The control-rate smoothing term is
+
+\begin{equation}
+J_{\mathrm{control}}
+=
+w_{\mathrm{ctrl}}
+\sum_{k=1}^{N}
+\left[
+q_a\left(\frac{a_k-a_{k-1}}{\Delta t}\right)^2
++
+q_{\delta}\left(\frac{\delta_k-\delta_{k-1}}{\Delta t}\right)^2
+\right].
+\end{equation}
+
+\section{Current Repulsive Potential Field}
+
+The live obstacle cost is no longer the old Gaussian potential. It is now a
+super-ellipsoid-based potential field with separate safe-zone and collision-zone
+costs.
+
+\subsection{Relative Pose in the Obstacle Frame}
+
+For obstacle center $(x_o,y_o)$ and obstacle heading $\psi_o$, the ego position
+is transformed into the obstacle-local frame as
+
+\begin{equation}
+\begin{bmatrix}
+x_{\mathrm{loc}} \\
+y_{\mathrm{loc}}
+\end{bmatrix}
+=
+R(-\psi_o)
+\begin{bmatrix}
+x_e-x_o \\
+y_e-y_o
+\end{bmatrix}.
+\end{equation}
+
+\subsection{Projected Ego Shape}
+
+Let the relative heading be
+
+\begin{equation}
+\Delta\psi = \psi_e-\psi_o.
+\end{equation}
+
+The ego footprint is projected onto the obstacle frame:
+
+\begin{equation}
+L_e^{\mathrm{proj}}
+=
+\left|L_e\cos(\Delta\psi)\right|
++
+\left|W_e\sin(\Delta\psi)\right|
+\end{equation}
+
+\begin{equation}
+W_e^{\mathrm{proj}}
+=
+\left|L_e\sin(\Delta\psi)\right|
++
+\left|W_e\cos(\Delta\psi)\right|.
+\end{equation}
+
+The static inflated base half-sizes are
+
+\begin{equation}
+x_0
+=
+\frac{L_e^{\mathrm{proj}} + L_o}{2}
++
+b_{\mathrm{long}}
+\end{equation}
+
+\begin{equation}
+y_0
+=
+\frac{W_e^{\mathrm{proj}} + W_o}{2}
++
+b_{\mathrm{lat}}.
+\end{equation}
+
+\subsection{Dynamic Inflation}
+
+The relative approach speeds are
+
+\begin{equation}
+\Delta u = \max\!\big(0,\; v_e\cos(\Delta\psi)-v_o\big)
+\end{equation}
+
+\begin{equation}
+\Delta v = \max\!\big(v_{\mathrm{lat,min}},\; |v_e\sin(\Delta\psi)|\big).
+\end{equation}
+
+The collision-zone half-sizes are
+
+\begin{equation}
+x_c = x_0 + \frac{\Delta u^2}{2a_{\max}}
+\end{equation}
+
+\begin{equation}
+y_c = y_0 + \frac{\Delta v^2}{2a_{\max}}.
+\end{equation}
+
+The safe-zone half-sizes are
+
+\begin{equation}
+x_s = x_0 + \Delta u T_r + \frac{\Delta u^2}{2a_{\mathrm{comfort}}}
+\end{equation}
+
+\begin{equation}
+y_s = y_0 + \Delta v T_r + \frac{\Delta v^2}{2a_{\mathrm{comfort}}}.
+\end{equation}
+
+\subsection{Geometric Limits on the Field Size}
+
+The current project also limits the field dimensions.
+
+The longitudinal half-lengths are capped by a maximum full field length
+$L_{\max}$:
+
+\begin{equation}
+x_c \leftarrow \min\left(x_c,\; \frac{L_{\max}}{2}\right),
+\qquad
+x_s \leftarrow \min\left(x_s,\; \frac{L_{\max}}{2}\right).
+\end{equation}
+
+The lateral half-widths are capped by the lane width $W_{\mathrm{lane}}$ and a
+lane-width fraction $f_{\mathrm{lane}}$:
+
+\begin{equation}
+y_c \leftarrow \min\left(y_c,\; \frac{W_{\mathrm{lane}}f_{\mathrm{lane}}}{2}\right),
+\qquad
+y_s \leftarrow \min\left(y_s,\; \frac{W_{\mathrm{lane}}f_{\mathrm{lane}}}{2}\right).
+\end{equation}
+
+\subsection{Normalized Super-Ellipsoid Distances}
+
+With super-ellipsoid exponent $n$, the normalized collision and safe distances are
+
+\begin{equation}
+r_c
+=
+\left[
+\left|\frac{x_{\mathrm{loc}}}{x_c}\right|^n
++
+\left|\frac{y_{\mathrm{loc}}}{y_c}\right|^n
+\right]^{1/n}
+\end{equation}
+
+\begin{equation}
+r_s
+=
+\left[
+\left|\frac{x_{\mathrm{loc}}}{x_s}\right|^n
++
+\left|\frac{y_{\mathrm{loc}}}{y_s}\right|^n
+\right]^{1/n}.
+\end{equation}
+
+\subsection{Stage Obstacle Cost}
+
+For each obstacle $i$ at stage $k$, the current repulsive cost is
+
+\begin{equation}
+J_{\mathrm{safe}}^{(i,k)}
+=
+w_s \exp\!\left[-k_s\big(r_s^{(i,k)}-s_s\big)\right]
+\end{equation}
+
+\begin{equation}
+J_{\mathrm{collision}}^{(i,k)}
+=
+w_c \exp\!\left[-k_c\big(r_c^{(i,k)}-s_c\big)\right]
+\end{equation}
+
+\begin{equation}
+J_{\mathrm{obs}}^{(i,k)}
+=
+J_{\mathrm{safe}}^{(i,k)}
++
+J_{\mathrm{collision}}^{(i,k)}.
+\end{equation}
+
+Therefore, the total repulsive term over the horizon is
+
+\begin{equation}
+J_{\mathrm{repulsive}}
+=
+\sum_{k=1}^{N}\sum_{i=1}^{M} J_{\mathrm{obs}}^{(i,k)}.
+\end{equation}
+
+\paragraph{Interpretation.}
+Both the safe-zone and collision-zone costs are always active. As the ego gets
+closer to the obstacle, the normalized distances $r_s$ and $r_c$ become smaller,
+which increases the exponential cost. The parameters $k_s,k_c$ control how
+quickly the cost changes with distance, while $s_s,s_c$ shift the effective
+distance level at which the exponent becomes significant.
+
+\section{Current Parameter Values}
+
+The current values below are taken from the live \texttt{MPC/mpc.yaml} file.
+
+\subsection{Planner and Timing}
+
+\begin{align}
+\text{Horizon} &= 3.0~\mathrm{s} \\
+\Delta t &= 0.05~\mathrm{s} \\
+\text{Planning frequency} &= 2~\mathrm{Hz}
+\end{align}
+
+\subsection{Attractive Cost Parameters}
+
+\begin{align}
+w_{\mathrm{att}} &= 1.0 \\
+[q_x,\; q_y,\; q_v,\; q_{\psi}] &= [10,\; 0,\; 1,\; 0]
+\end{align}
+
+\subsection{Lane-Center Cost Parameters}
+
+\begin{align}
+w_0 &= 30.0 \\
+\alpha &= 0.97 \\
+q_{\psi,\mathrm{lane}} &= 10.0
+\end{align}
+
+\subsection{Control Cost Parameters}
+
+\begin{align}
+w_{\mathrm{ctrl}} &= 30.0 \\
+[q_a,\; q_{\delta}] &= [10,\; 10]
+\end{align}
+
+\subsection{Repulsive Potential Parameters}
+
+\begin{align}
+w_s &= 100 \\
+w_c &= 100 \\
+k_s &= 3.0 \\
+s_s &= 1.5 \\
+k_c &= 10.0 \\
+s_c &= 1.5 \\
+a_{\max} &= 10.0~\mathrm{m/s^2} \\
+a_{\mathrm{comfort}} &= 2.0~\mathrm{m/s^2} \\
+T_r &= 1.0~\mathrm{s} \\
+b_{\mathrm{long}} &= 0.5~\mathrm{m} \\
+b_{\mathrm{lat}} &= 1.0~\mathrm{m} \\
+n &= 4 \\
+v_{\mathrm{lat,min}} &= 0.1~\mathrm{m/s} \\
+L_{\max} &= 15.0~\mathrm{m} \\
+f_{\mathrm{lane}} &= 1.0
+\end{align}
+
+\subsection{Representative Constraints}
+
+The commonly used scenario constraints are
+
+\begin{align}
+v &\in [0,\; 10]~\mathrm{m/s} \\
+a &\in [-4,\; 2.5]~\mathrm{m/s^2} \\
+\delta &\in [-0.6,\; 0.6]~\mathrm{rad} \\
+\dot{\delta} &\in [-0.4,\; 0.4]~\mathrm{rad/s}.
+\end{align}
+
+\end{document}
