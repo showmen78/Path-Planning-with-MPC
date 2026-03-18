@@ -248,12 +248,13 @@ class AStarGlobalPlanner:
             if existing is None or abs(float(lateral_offset_m)) < abs(float(existing)):
                 lane_offsets[int(node.lane_id)] = float(lateral_offset_m)
 
-        can_change_left = any(offset_m > 0.5 for offset_m in lane_offsets.values())
-        can_change_right = any(offset_m < -0.5 for offset_m in lane_offsets.values())
+        current_lane_id = int(nearest_node.lane_id)
+        can_change_left = int(current_lane_id + 1) in lane_offsets
+        can_change_right = int(current_lane_id - 1) in lane_offsets
 
         return {
             "road_id": str(nearest_node.road_id),
-            "lane_id": int(nearest_node.lane_id),
+            "lane_id": int(current_lane_id),
             "can_change_left": bool(can_change_left),
             "can_change_right": bool(can_change_right),
         }

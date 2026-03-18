@@ -18,11 +18,8 @@
 
 \definecolor{codebg}{RGB}{245,247,250}
 \definecolor{codeborder}{RGB}{220,224,230}
-\definecolor{codered}{RGB}{163,21,21}
-\definecolor{codeblue}{RGB}{0,92,197}
-\definecolor{codegreen}{RGB}{0,120,40}
 
-\lstdefinestyle{jsonstyle}{
+\lstdefinestyle{codestyle}{
     basicstyle=\ttfamily\small,
     backgroundcolor=\color{codebg},
     frame=single,
@@ -41,7 +38,7 @@
 \setlist[itemize]{leftmargin=1.4em}
 \setlist[enumerate]{leftmargin=1.6em}
 
-\title{Behavior Planner Prompt Template and Worked Examples}
+\title{Behavior Planner System Instruction and Runtime Prompt}
 \author{}
 \date{}
 
@@ -51,325 +48,176 @@
 
 \section{Purpose}
 
-This document provides a structured prompt template for a high-level autonomous
-vehicle Behavior Planner, together with worked examples. The planner is assumed
-to read ego state, HD map context, route information, surrounding vehicle
-predictions, and V2X broadcasts, then return a strict JSON response containing
-the selected behavior, target speed, outbound CAV broadcast, and reasoning.
+This document records the \emph{current} compact LLM behavior-planner interface
+used by the CARLA branch. The system instruction is sent once at startup. After
+that, each planner query uses the compact prompt input shown below.
 
-\section{Prompt Template}
+\section{System Instruction Summary}
 
-\subsection{System Instruction}
+\subsection{Role}
 
-\begin{quote}
-You are the high-level Behavior Planner for an autonomous vehicle (Ego).
-Your job is to read the current state of the environment, HD Map, Global Route,
-predicted intentions, and V2X broadcasts, then output a strict JSON response.
-Safety and ``emergency'' broadcasts supersede all other routing goals.
-\end{quote}
+The model is the high-level behavior planner for the ego vehicle. It must read
+the compact environment state and choose one of the allowed behaviors:
 
-\subsection{Allowed Behaviors}
-
-\begin{lstlisting}[style=jsonstyle]
-["LANE_KEEP", "LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT",
- "ACCELERATE", "DECELERATE", "STOP_AT_LINE", "EMERGENCY_BRAKE"]
+\begin{lstlisting}[style=codestyle]
+LANE_KEEP
+LANE_CHANGE_LEFT
+LANE_CHANGE_RIGHT
+EMERGENCY_BRAKE
 \end{lstlisting}
 
-\subsection{Input Structure}
+\subsection{Lane-ID Convention}
 
-\begin{enumerate}
-    \item \textbf{Ego Vehicle State}
-    \begin{itemize}
-        \item State $[x, y, v, \psi]$: \texttt{\{ego\_x\}}, \texttt{\{ego\_y\}}, \texttt{\{ego\_v\}} m/s, \texttt{\{ego\_psi\}} rad
-        \item Current Road ID: \texttt{\{ego\_road\_id\}}
-        \item Lane ID: \texttt{\{ego\_lane\_id\}}
-    \end{itemize}
-
-    \item \textbf{Global Route Plan (A* Navigation)}
-    \begin{itemize}
-        \item Distance to Destination: \texttt{\{dist\_to\_dest\}} km
-        \item Next Macro Maneuver: \texttt{\{a\_star\_next\_maneuver\}}
-        \item Optimal Lane for Route: \texttt{\{a\_star\_optimal\_lane\}}
-    \end{itemize}
-
-    \item \textbf{CARLA HD Map Context}
-    \begin{itemize}
-        \item Speed Limit: \texttt{\{speed\_limit\}} m/s
-        \item Legal Lane Changes:
-        \begin{itemize}
-            \item Left: \texttt{\{can\_change\_left\}}
-            \item Right: \texttt{\{can\_change\_right\}}
-        \end{itemize}
-        \item Next Traffic Light State: \texttt{\{traffic\_light\_state\}}
-        \item Distance to Traffic Light: \texttt{\{dist\_to\_light\}} m
-    \end{itemize}
-
-    \item \textbf{Surrounding Vehicles and Predicted Intentions}
-    \begin{itemize}
-        \item Vehicle ID: \texttt{\{v1\_id\}}
-        \begin{itemize}
-            \item State $[x, y, v, \psi]$: \texttt{\{v1\_x\}}, \texttt{\{v1\_y\}}, \texttt{\{v1\_v\}} m/s, \texttt{\{v1\_psi\}} rad
-            \item Potential Field Risk: \texttt{\{v1\_risk\_level\}}
-            \item Predicted Intention: text description
-        \end{itemize}
-        \item Vehicle ID: \texttt{\{v2\_id\}}
-        \begin{itemize}
-            \item State $[x, y, v, \psi]$: \texttt{\{v2\_x\}}, \texttt{\{v2\_y\}}, \texttt{\{v2\_v\}} m/s, \texttt{\{v2\_psi\}} rad
-            \item Potential Field Risk: \texttt{\{v2\_risk\_level\}}
-            \item Predicted Intention: text description
-        \end{itemize}
-    \end{itemize}
-
-    \item \textbf{V2X / CAV Broadcasts (Received)}
-    \begin{itemize}
-        \item Structured list of received dictionaries in the form:
-        \begin{lstlisting}[style=jsonstyle]
-[
-  { "id": "...", "type": "...", "message": "..." }
-]
-        \end{lstlisting}
-    \end{itemize}
-\end{enumerate}
-
-\subsection{Task Statement}
-
-\begin{quote}
-Determine the safest allowed behavior. Provide a target speed
-(\texttt{target\_v}, in m/s), the chosen behavior, a message dictionary to
-broadcast to other CAVs, and a brief reasoning.
-\end{quote}
-
-\subsection{CAV Broadcast Structure}
-
-The outbound CAV broadcast must always use the exact structure:
-
-\begin{lstlisting}[style=jsonstyle]
-{ "id": "...", "type": "...", "message": "..." }
-\end{lstlisting}
-
-\noindent with:
 \begin{itemize}
-    \item \texttt{id}: sender vehicle identifier
-    \item \texttt{type}: broadcast category, typically \texttt{normal} or \texttt{emergency}
-    \item \texttt{message}: human-readable broadcast message
+    \item The prompt uses a compact lane convention relative to the left edge
+    of the road.
+    \item Lane $-1$ is the left-most driving lane.
+    \item Lane $-2$ is the next lane to the right.
+    \item Lane IDs decrease as the lane moves rightward.
 \end{itemize}
 
-\subsection{Expected JSON Format}
+\subsection{Prompt Fields}
 
-\begin{lstlisting}[style=jsonstyle]
-{
-  "behavior": "BEHAVIOR_NAME",
-  "target_v": 0.0,
-  "cav_broadcast": {
-    "id": "vehicle_id",
-    "type": "normal/emergency",
-    "message": "Your broadcast message here"
-  },
-  "reasoning": "Explanation here"
-}
-\end{lstlisting}
-
-\section{Example 1: Lane Closure}
-
-\subsection{Prompt Instance}
+The current system instruction defines the following input blocks:
 
 \begin{enumerate}
-    \item \textbf{Ego Vehicle State}
-    \begin{itemize}
-        \item State $[x, y, v, \psi]$: $100.0$, $10.5$, $15.0$ m/s, $0.0$ rad
-        \item Current Road ID: $12$
-        \item Lane ID: $3$ 
-    \end{itemize}
-
-    \item \textbf{Global Route Plan}
-    \begin{itemize}
-        \item Distance to Destination: $5.2$ km
-        \item Next Macro Maneuver: Continue Straight
-        \item Optimal Lane for Route: $3$
-    \end{itemize}
-
-    \item \textbf{CARLA HD Map Context}
-    \begin{itemize}
-        \item Speed Limit: $20.0$ m/s
-        \item Legal Lane Changes: Left = True, Right = False
-        \item Next Traffic Light State: Green (Distance: $400.0$ m)
-        \item Map Warning: Static blockage in Lane 3 at distance $100.0$ m
-    \end{itemize}
-
-    \item \textbf{Surrounding Vehicles and Predicted Intentions}
-    \begin{itemize}
-        \item Vehicle ID: $101$
-        \begin{itemize}
-            \item State $[x, y, v, \psi]$: $102.0$, $7.0$, $15.0$ m/s, $0.0$ rad
-            \item Potential Field Risk: Warning Zone
-            \item Predicted Intention: Maintaining lane 2, steady speed
-        \end{itemize}
-    \end{itemize}
-
-    \item \textbf{V2X / CAV Broadcasts}
-    \begin{lstlisting}[style=jsonstyle]
-[
-  {
-    "id": 101,
-    "type": "normal",
-    "message": "Maintaining speed at 15 m/s."
-  }
-]
-    \end{lstlisting}
+    \item \texttt{ID:[prompt\_id]}
+    \item \texttt{Ego01:[x,y,v,psi,Llane]}
+    \item \texttt{ROUTE:[lane\_safe\_l,lane\_safe\_c,lane\_safe\_r]}
+    \item \texttt{PREV:[behavior]}
+    \item Zero or more surrounding-vehicle lines:
+    \texttt{V[id]:[x,y,v,psi,Llane,I]}
 \end{enumerate}
 
-\subsection{Gemini Response}
+\subsection{Route Safety Meaning}
 
-\begin{lstlisting}[style=jsonstyle]
-{
-  "behavior": "DECELERATE",
-  "target_v": 10.0,
-  "cav_broadcast": {
-    "id": "Ego",
-    "type": "normal",
-    "message": "Decelerating to yield to Vehicle 101. Preparing to merge into Lane 2 to avoid obstacle."
-  },
-  "reasoning": "There is a static blockage 100 meters ahead in the current lane (Lane 3). Ego must transition to Lane 2, but Vehicle 101 is currently occupying the adjacent space in the Warning Zone at the same speed (15 m/s). Ego must decelerate to fall behind Vehicle 101, opening up a safe gap to execute a LANE_CHANGE_LEFT in the near future."
-}
+The current route block is
+
+\begin{lstlisting}[style=codestyle]
+ROUTE:[lane_safe_l, lane_safe_c, lane_safe_r]
 \end{lstlisting}
 
-\section{Example 2: Adjacent Vehicle Intends to Merge Into Ego Lane}
+with binary values:
 
-\subsection{Prompt Instance}
+\begin{itemize}
+    \item \texttt{0}: not safe
+    \item \texttt{1}: safe
+\end{itemize}
+
+The instruction defines safety as follows:
+
+\begin{itemize}
+    \item If a vehicle is \textbf{ahead} in that lane, its longitudinal gap
+    must be greater than
+    \[
+    \text{lookahead distance} + \text{forward safety buffer}.
+    \]
+    \item If a vehicle is \textbf{behind} in that lane, its longitudinal gap
+    must be greater than the configured rear safety distance.
+\end{itemize}
+
+\subsection{Decision Policy}
+
+The current instruction gives the model the following decision order:
 
 \begin{enumerate}
-    \item \textbf{Ego Vehicle State}
-    \begin{itemize}
-        \item State $[x, y, v, \psi]$: $250.0$, $0.0$, $20.0$ m/s, $0.0$ rad
-        \item Current Road ID: $15$
-        \item Lane ID: $0$
-    \end{itemize}
-
-    \item \textbf{Global Route Plan}
-    \begin{itemize}
-        \item Distance to Destination: $8.5$ km
-        \item Next Macro Maneuver: Continue Straight
-        \item Optimal Lane for Route: $0$
-    \end{itemize}
-
-    \item \textbf{CARLA HD Map Context}
-    \begin{itemize}
-        \item Speed Limit: $25.0$ m/s
-        \item Legal Lane Changes: Left = False, Right = True
-        \item Next Traffic Light State: None
-    \end{itemize}
-
-    \item \textbf{Surrounding Vehicles and Predicted Intentions}
-    \begin{itemize}
-        \item Vehicle ID: $205$ (slightly ahead in right lane 1)
-        \begin{itemize}
-            \item State $[x, y, v, \psi]$: $265.0$, $3.5$, $18.0$ m/s, $0.1$ rad
-            \item Potential Field Risk: Warning Zone
-            \item Predicted Intention: Speeding up, will change lane from 1 to 0
-        \end{itemize}
-    \end{itemize}
-
-    \item \textbf{V2X / CAV Broadcasts}
-    \begin{lstlisting}[style=jsonstyle]
-[
-  {
-    "id": 205,
-    "type": "normal",
-    "message": "Initiating lane change to Lane 0 to pass slower traffic."
-  }
-]
-    \end{lstlisting}
+    \item Use \texttt{EMERGENCY\_BRAKE} only for a sudden close hazard.
+    \item If \texttt{lane\_safe\_c = 1}, choose \texttt{LANE\_KEEP}.
+    \item Consider a lane change only if \texttt{lane\_safe\_c = 0}.
+    \item If the previous decision was a lane change and the current lane is
+    still unsafe, prefer continuing the same lane change.
+    \item Repeated \texttt{LANE\_CHANGE\_LEFT} or
+    \texttt{LANE\_CHANGE\_RIGHT} responses mean continue the same maneuver,
+    not request another extra lane change.
 \end{enumerate}
 
-\subsection{Gemini Response}
+\subsection{Required Output}
 
-\begin{lstlisting}[style=jsonstyle]
+The model must return only:
+
+\begin{lstlisting}[style=codestyle]
 {
-  "behavior": "DECELERATE",
-  "target_v": 15.0,
-  "cav_broadcast": {
-    "id": "Ego",
-    "type": "normal",
-    "message": "Acknowledged Vehicle 205 merge intent. Decelerating to open a safe gap in Lane 0."
-  },
-  "reasoning": "Vehicle 205 is 15 meters ahead in Lane 1, has entered the potential field Warning Zone, and broadcasted its intent to cut into Lane 0. Since Ego is traveling faster (20 m/s) than Vehicle 205 (18 m/s), maintaining speed would risk a collision. Ego will decelerate to yield the space, allowing Vehicle 205 to safely merge while Ego remains in its A* optimal lane."
+  "id": "PROMPT_ID",
+  "behavior": "BEHAVIOR_NAME"
 }
 \end{lstlisting}
 
-\section{Example 3: Emergency Vehicle Override}
+\section{Current Prompt Input Format}
 
-\subsection{Prompt Instance}
+\subsection{Template}
 
-\begin{enumerate}
-    \item \textbf{Ego Vehicle State}
-    \begin{itemize}
-        \item State $[x, y, v, \psi]$: $500.0$, $0.0$, $18.0$ m/s, $0.0$ rad
-        \item Current Road ID: $22$
-        \item Lane ID: $0$ (left-most lane)
-    \end{itemize}
+\begin{lstlisting}[style=codestyle]
+ID:[prompt_id]
 
-    \item \textbf{Global Route Plan}
-    \begin{itemize}
-        \item Distance to Destination: $3.0$ km
-        \item Next Macro Maneuver: Left turn at next intersection
-        \item Optimal Lane for Route: $0$
-    \end{itemize}
+Ego01:[x,y,v,psi,Llane]
 
-    \item \textbf{CARLA HD Map Context}
-    \begin{itemize}
-        \item Speed Limit: $20.0$ m/s
-        \item Legal Lane Changes: Left = False, Right = True
-        \item Next Traffic Light State: Green (Distance: $800.0$ m)
-    \end{itemize}
+ROUTE:[lane_safe_l,lane_safe_c,lane_safe_r]
 
-    \item \textbf{Surrounding Vehicles and Predicted Intentions}
-    \begin{itemize}
-        \item Vehicle ID: $301$ 
-        \begin{itemize}
-            \item State $[x, y, v, \psi]$: $530.0$, $0.0$, $18.0$ m/s, $0.0$ rad
-            \item Potential Field Risk: Safe Zone
-            \item Predicted Intention: Maintaining lane 0, steady speed
-        \end{itemize}
-        \item Vehicle ID: $911$ (ambulance, far behind in ego lane 0)
-        \begin{itemize}
-            \item State $[x, y, v, \psi]$: $300.0$, $0.0$, $35.0$ m/s, $0.0$ rad
-            \item Potential Field Risk: Safe Zone, but closing rapidly
-            \item Predicted Intention: High speed, maintaining lane 0
-        \end{itemize}
-    \end{itemize}
+PREV:[behavior]
 
-    \item \textbf{V2X / CAV Broadcasts}
-    \begin{lstlisting}[style=jsonstyle]
-[
-  {
-    "id": 301,
-    "type": "normal",
-    "message": "Cruising at 18 m/s."
-  },
-  {
-    "id": 911,
-    "type": "emergency",
-    "message": "Ambulance responding to code 3. Clear Lane 0 immediately!"
-  }
-]
-    \end{lstlisting}
-\end{enumerate}
-
-\subsection{Gemini Response}
-
-\begin{lstlisting}[style=jsonstyle]
-{
-  "behavior": "LANE_CHANGE_RIGHT",
-  "target_v": 18.0,
-  "cav_broadcast": {
-    "id": "Ego",
-    "type": "normal",
-    "message": "Yielding to emergency vehicle 911. Executing lane change to Lane 1."
-  },
-  "reasoning": "Received an emergency broadcast from Vehicle 911 (Ambulance) approaching rapidly from behind in Lane 0. Emergency protocols supersede the A* global route preference for Lane 0. Lane 1 is clear, so executing an immediate right lane change to yield."
-}
+V[id_1]:[x,y,v,psi,Llane,I]
+V[id_2]:[x,y,v,psi,Llane,I]
+...
 \end{lstlisting}
 
+\subsection{Field Definitions}
 
+\begin{itemize}
+    \item \texttt{x, y}: vehicle position in world coordinates
+    \item \texttt{v}: longitudinal speed in m/s
+    \item \texttt{psi}: heading angle in radians
+    \item \texttt{Llane}: compact prompt lane ID
+    \item \texttt{I}: predicted intention code
+\end{itemize}
+
+The live surrounding-vehicle intention codes are:
+
+\begin{lstlisting}[style=codestyle]
+S  = stationary
+KC = lane keeping + constant speed
+KA = lane keeping + accelerating
+KB = lane keeping + braking
+LC = lane change left + constant speed
+LA = lane change left + accelerating
+LB = lane change left + braking
+RC = lane change right + constant speed
+RA = lane change right + accelerating
+RB = lane change right + braking
+\end{lstlisting}
+
+\section{Worked Prompt Example}
+
+\begin{lstlisting}[style=codestyle]
+ID:[12]
+
+Ego01:[8.65,-3.185,6.548,0.183481,-3]
+
+ROUTE:[1,1,0]
+
+PREV:[LANE_KEEP]
+
+Vobs_static_workzone:[18.4,-7.4,0,-0.0881,-4,S]
+Vcav_waypoint_follow2:[-12.035,-0.476,4,-0.102896,-3,KC]
+\end{lstlisting}
+
+In this example:
+
+\begin{itemize}
+    \item the left adjacent lane is safe,
+    \item the current lane is safe,
+    \item the right adjacent lane is not safe,
+    \item and the previous decision was \texttt{LANE\_KEEP}.
+\end{itemize}
+
+\section{Current Runtime Notes}
+
+\begin{itemize}
+    \item The system instruction is loaded from
+    \texttt{behavior\_planner/system\_instruction.txt}.
+    \item The compact prompt is generated by
+    \texttt{behavior\_planner/prompt\_builder.py}.
+    \item The response parser expects the returned \texttt{id} to match the
+    latest prompt id before accepting the decision.
+\end{itemize}
 
 \end{document}

@@ -11,12 +11,5 @@ pyyaml
 # OpenAI API client used by the behavior-planner LLM loop.
 openai
 
-# Runtime visualization and vehicle/road rendering.
+# Camera display window for CARLA scenario visualization.
 pygame
-
-# End-of-run plotting and the standalone super_ellipsoid.py analysis script.
-matplotlib
-
-# Optional:
-# If you later install an OSQP CUDA backend manually, keep it outside this file
-# unless you want requirements installation to depend on a specific CUDA stack.

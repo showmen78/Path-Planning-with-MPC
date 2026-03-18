@@ -530,8 +530,8 @@ class MPC:
         """
         Build per-stage lane-center reference inside MPC.
 
-        Scenarios provide only road/lane waypoints. MPC owns the lane-keeping
-        cost and the reference chain used by that cost.
+        The integration layer provides road/lane waypoints. MPC owns the
+        lane-keeping cost and the reference chain used by that cost.
         """
 
         if lane_center_waypoints is None or len(lane_center_waypoints) == 0:
@@ -795,6 +795,47 @@ class MPC:
             r_c = normalized distance to the collision zone
         """
 
+        geometry = self._superellipsoid_zone_geometry(
+            ego_state=ego_state,
+            obstacle_state=obstacle_state,
+            obstacle_length_m=obstacle_length_m,
+            obstacle_width_m=obstacle_width_m,
+        )
+        rc = float(geometry["rc"])
+        rs = float(geometry["rs"])
+        ego_x_m = float(ego_state[0]) if len(ego_state) >= 1 else 0.0
+        ego_y_m = float(ego_state[1]) if len(ego_state) >= 2 else 0.0
+        ego_v_mps = max(0.0, float(ego_state[2]) if len(ego_state) >= 3 else 0.0)
+        ego_psi_rad = float(ego_state[3]) if len(ego_state) >= 4 else 0.0
+
+        obs_x_m = float(obstacle_state[0]) if len(obstacle_state) >= 1 else 0.0
+        obs_y_m = float(obstacle_state[1]) if len(obstacle_state) >= 2 else 0.0
+        obs_v_mps = max(0.0, float(obstacle_state[2]) if len(obstacle_state) >= 3 else 0.0)
+        obs_psi_rad = float(obstacle_state[3]) if len(obstacle_state) >= 4 else 0.0
+
+        cost_safe = float(self.repulsive_cost.w_safe_zone) * math.exp(
+            -float(self.repulsive_cost.safe_exponential_gain)
+            * (float(rs) - float(self.repulsive_cost.safe_distance_shift))
+        )
+        cost_collision = float(self.repulsive_cost.w_collision_zone) * math.exp(
+            -float(self.repulsive_cost.collision_exponential_gain)
+            * (float(rc) - float(self.repulsive_cost.collision_distance_shift))
+        )
+        return float(cost_safe), float(cost_collision)
+
+    def _superellipsoid_zone_geometry(
+        self,
+        ego_state: Sequence[float],
+        obstacle_state: Sequence[float],
+        obstacle_length_m: float,
+        obstacle_width_m: float,
+    ) -> Dict[str, float]:
+        """
+        Return the active super-ellipsoid zone geometry used by the live cost.
+
+        The returned values are aligned to the obstacle frame.
+        """
+
         ego_x_m = float(ego_state[0]) if len(ego_state) >= 1 else 0.0
         ego_y_m = float(ego_state[1]) if len(ego_state) >= 2 else 0.0
         ego_v_mps = max(0.0, float(ego_state[2]) if len(ego_state) >= 3 else 0.0)
@@ -826,9 +867,11 @@ class MPC:
         projected_ego_width_m = abs(float(self.ego_length_m) * math.sin(float(heading_diff_rad)))
         projected_ego_width_m += abs(float(self.ego_width_m) * math.cos(float(heading_diff_rad)))
 
-        x0_m = 0.5 * (projected_ego_length_m + max(1e-6, float(obstacle_length_m)))
+        obstacle_length_m = max(1e-6, float(obstacle_length_m))
+        obstacle_width_m = max(1e-6, float(obstacle_width_m))
+        x0_m = 0.5 * (projected_ego_length_m + obstacle_length_m)
         x0_m += float(self.repulsive_cost.static_longitudinal_buffer_m)
-        y0_m = 0.5 * (projected_ego_width_m + max(1e-6, float(obstacle_width_m)))
+        y0_m = 0.5 * (projected_ego_width_m + obstacle_width_m)
         y0_m += float(self.repulsive_cost.static_lateral_buffer_m)
 
         a_max_mps2 = max(1e-6, float(self.repulsive_cost.max_braking_deceleration_mps2))
@@ -846,8 +889,9 @@ class MPC:
         xs_m = min(float(xs_m), longitudinal_half_limit_m)
 
         if bool(self.repulsive_cost.limit_lateral_zone_to_lane_width):
-            lateral_half_limit_m = 0.5 * float(self.lane_width_m) * float(self.repulsive_cost.max_lateral_zone_lane_fraction)
-            lateral_half_limit_m = max(1e-6, float(lateral_half_limit_m))
+            lane_width_limit_m = float(self.lane_width_m) * float(self.repulsive_cost.max_lateral_zone_lane_fraction)
+            full_width_limit_m = max(float(lane_width_limit_m), float(obstacle_width_m))
+            lateral_half_limit_m = max(1e-6, 0.5 * float(full_width_limit_m))
             yc_m = min(float(yc_m), lateral_half_limit_m)
             ys_m = min(float(ys_m), lateral_half_limit_m)
 
@@ -855,15 +899,22 @@ class MPC:
         rc = (abs(float(x_local_m) / max(1e-6, float(xc_m))) ** n + abs(float(y_local_m) / max(1e-6, float(yc_m))) ** n) ** (1.0 / n)
         rs = (abs(float(x_local_m) / max(1e-6, float(xs_m))) ** n + abs(float(y_local_m) / max(1e-6, float(ys_m))) ** n) ** (1.0 / n)
 
-        cost_safe = float(self.repulsive_cost.w_safe_zone) * math.exp(
-            -float(self.repulsive_cost.safe_exponential_gain)
-            * (float(rs) - float(self.repulsive_cost.safe_distance_shift))
-        )
-        cost_collision = float(self.repulsive_cost.w_collision_zone) * math.exp(
-            -float(self.repulsive_cost.collision_exponential_gain)
-            * (float(rc) - float(self.repulsive_cost.collision_distance_shift))
-        )
-        return float(cost_safe), float(cost_collision)
+        return {
+            "x_local_m": float(x_local_m),
+            "y_local_m": float(y_local_m),
+            "x0_m": float(x0_m),
+            "y0_m": float(y0_m),
+            "xc_m": float(xc_m),
+            "yc_m": float(yc_m),
+            "xs_m": float(xs_m),
+            "ys_m": float(ys_m),
+            "shape_exponent": float(n),
+            "obstacle_x_m": float(obs_x_m),
+            "obstacle_y_m": float(obs_y_m),
+            "obstacle_psi_rad": float(obs_psi_rad),
+            "rc": float(rc),
+            "rs": float(rs),
+        }
 
     def _superellipsoid_obstacle_cost(
         self,
@@ -1588,8 +1639,13 @@ class MPC:
                 self.constraints.min_velocity_mps,
                 float(stage_speed_upper_bound_mps),
             )
-        # Optional hard terminal-speed constraint (scenario-configurable).
-        if bool(self.constraints.enforce_terminal_velocity_constraint):
+        # Optional hard terminal-speed constraint. Apply it only for stop-like
+        # destinations (destination speed near zero), otherwise every rolling
+        # temporary goal would incorrectly force the horizon-end speed to zero.
+        terminal_speed_constraint_active = bool(self.constraints.enforce_terminal_velocity_constraint) and (
+            abs(float(x_ref_target[2])) <= float(self.final_stop_speed_cap_activation_threshold_mps)
+        )
+        if terminal_speed_constraint_active:
             add_constraint(
                 {index.state_index(self.horizon_steps, 2): 1.0},
                 float(self.constraints.terminal_velocity_mps),

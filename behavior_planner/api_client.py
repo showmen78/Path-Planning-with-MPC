@@ -143,8 +143,8 @@ class BehaviorPlannerAPIClient:
         """
         Send only the system instruction once and cache the root response id.
 
-        This is used before the scenario starts so the initial instruction
-        latency does not block the first live environment-input request.
+        This is used before the live prompt loop starts so the initial
+        instruction latency does not block the first environment-input request.
         """
 
         if not self.enabled:

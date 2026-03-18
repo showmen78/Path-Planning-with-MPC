@@ -1,7 +1,6 @@
-"""Utility package exports for MPC_custom."""
+"""Utility exports for the planning-only stack."""
 
 from .config_loader import deep_merge_dicts, load_yaml_file
-from .pid_controller import TrajectoryPIDController
 from .tracker import Tracker
 
-__all__ = ["deep_merge_dicts", "load_yaml_file", "Tracker", "TrajectoryPIDController"]
+__all__ = ["deep_merge_dicts", "load_yaml_file", "Tracker"]

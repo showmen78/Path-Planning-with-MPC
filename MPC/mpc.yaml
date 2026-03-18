@@ -15,18 +15,6 @@ mpc:
   # compute cost. Decrease -> cheaper runtime, but plans can go stale.
   trajectory_generation_frequency_hz: 2.0
 
-  # Distance [m] below which the main loop considers the active destination
-  # reached. Increase -> declare success earlier. Decrease -> require tighter
-  # final convergence before stopping the run logic.
-  destination_reached_threshold_m: 0.5
-
-  # End-of-run plotting switches.
-  # plot_cost: save cost plots.
-  # plot_properties: save non-cost plots such as ego motion and planned-step
-  # profile figures.
-  plot_cost: false
-  plot_properties: false
-
   # Runtime behavior-planner loop for the LLM. This loop is separate from the
   # MPC replan loop. It builds prompts, optionally calls the API, and caches
   # the latest valid decision for the MPC loop to apply.
@@ -92,25 +80,17 @@ mpc:
     print_prompt: true
     print_response: true
 
-  # Per-replan plots built from the MPC-planned sequence itself, not the later
-  # PID-followed controls applied to the simulated ego.
-  planned_profile_plot:
-    # Master switch for these planned-step profile plots.
-    enabled: true
 
-    # Number of early MPC stages k=0..steps_to_plot-1 to plot for each replan.
-    # Increase -> more future stages are visualized. Decrease -> focus on the
-    # very near-term MPC plan only.
-    steps_to_plot: 5
+    
 
-  # Rolling temporary-destination settings shared by the scenario layer and the
-  # MPC interface. These parameters control what destination state is fed into
-  # the optimizer before each replan.
+  # Rolling temporary-destination settings shared by the integration layer and
+  # the MPC interface. These parameters control what destination state is fed
+  # into the optimizer before each replan.
   local_goal:
     # Speed reference [m/s] attached to rolling temporary destinations.
     # Increase -> temporary goals encourage more aggressive cruising.
     # Decrease -> temporary goals become more conservative.
-    v_ref_mps: 20.0
+    v_ref_mps: 5.0
 
     # Extra forward buffer [m] added on top of the current lookahead distance
     # when the behavior planner rebuilds the temporary destination position on
@@ -152,13 +132,13 @@ mpc:
     #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
     # Increase -> lookahead grows faster with ego speed.
     # Decrease -> speed has less effect on lookahead distance.
-    dynamic_lookahead_speed_gain: 3
+    dynamic_lookahead_speed_gain: 4 #3
 
     # k_c in:
     #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
     # Increase -> curvature shortens lookahead more aggressively.
     # Decrease -> curved-road penalty becomes weaker.
-    dynamic_lookahead_curvature_gain: 20.0
+    dynamic_lookahead_curvature_gain: 10.0
 
     # Distance [m] between the three forward samples used to estimate
     # curvature with:
@@ -169,20 +149,13 @@ mpc:
     # Decrease -> more local, more sensitive curvature estimate.
     dynamic_lookahead_curvature_sample_spacing_m: 10.0
 
-    # Number of waypoints ahead of the ego used to place the temporary
-    # destination on the final-destination lane when dynamic lookahead is
-    # disabled or when a distance-based target cannot be evaluated.
-    # Increase -> farther fallback temporary goal, smoother but less reactive.
-    # Decrease -> nearer fallback temporary goal, more reactive but can chatter.
-    lookahead_waypoint_count: 20
-
     # Lock the temporary destination to the real final destination when the
     # temporary goal is this close [m] to the final stop/goal point.
     # Increase -> switch to final-goal behavior earlier.
     # Decrease -> keep rolling temporary goals active longer.
     lock_to_final_distance_m: 30.0
 
-    # Final-goal success threshold [m] used by rolling-goal scenarios.
+    # Final-goal success threshold [m] used by the rolling-goal logic.
     # Increase -> easier to declare the final goal reached.
     # Decrease -> tighter final-position requirement.
     final_reached_threshold_m: 0.5
@@ -336,7 +309,7 @@ mpc:
       # Global weight on control smoothness.
       # Increase -> smoother accel/steer changes, but more sluggish motion.
       # Decrease -> more aggressive control changes.
-      w_control: 30.0
+      w_control: 30.0 #30
 
       # Rate-change penalties:
       #   q_a     on ((a_k-a_{k-1})/dt)^2
@@ -477,35 +450,6 @@ mpc:
       # Increase -> more numerical stability, but more curvature smoothing.
       # Decrease -> closer to the raw local Hessian, but less robust.
       min_hessian_eig: 1.0e-9
-
-      visualization:
-        # Draw the live super-ellipsoid field around each non-ego object in the
-        # pygame window using the same safe/collision zones as the MPC cost.
-        # true  -> show the potential-field overlay in all scenarios.
-        # false -> hide the overlay entirely.
-        enabled: true
-
-        # Raster resolution used before scaling/rotation for each obstacle
-        # field patch.
-        # Increase -> smoother contour edges, more CPU cost per frame.
-        # Decrease -> faster rendering, rougher contour edges.
-        grid_resolution: 120
-
-        # Extra padding [m] drawn outside the larger of the safe/collision
-        # zones so the overlay is not clipped too tightly.
-        # Increase -> larger visible field footprint.
-        # Decrease -> tighter crop around the field.
-        draw_margin_m: 0.5
-
-        # RGBA color used for the safe zone where r_s <= 1.
-        # Increase alpha -> stronger green overlay.
-        # Decrease alpha -> more transparent green overlay.
-        safe_zone_color_rgba: [0, 200, 0, 70]
-
-        # RGBA color used for the collision zone where r_c <= 1.
-        # Increase alpha -> stronger red overlay.
-        # Decrease alpha -> more transparent red overlay.
-        collision_zone_color_rgba: [220, 40, 40, 110]
 
   solver:
     # Maximum OSQP iterations.

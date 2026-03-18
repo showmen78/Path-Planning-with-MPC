@@ -1,9 +1,5 @@
 """
-Configuration loading and merge utilities for MPC_custom.
-
-This module centralizes YAML parsing and recursive configuration merging so each
-subsystem (vehicle manager, road, MPC, collision checker, tracker, scenarios)
-can keep its own YAML defaults while scenarios override only what is needed.
+Configuration loading and merge utilities for the planning stack.
 """
 
 from __future__ import annotations
@@ -28,8 +24,7 @@ def load_yaml_file(path: str) -> Dict[str, Any]:
 
     Notes:
         - This helper enforces dictionary-root YAML files because the project
-          configuration is organized as named sections (simulation, road, mpc,
-          vehicles, tracker, etc.).
+          configuration is organized as named sections (`mpc`, `tracker`, etc.).
     """
 
     with open(path, "r", encoding="utf-8") as file:
@@ -55,7 +50,7 @@ def deep_merge_dicts(base: Mapping[str, Any], override: Mapping[str, Any]) -> Di
         base:
             Mapping[str, Any], default configuration tree.
         override:
-            Mapping[str, Any], scenario-specific override tree.
+            Mapping[str, Any], override tree applied on top of `base`.
 
     Output:
         dict[str, Any], merged configuration.

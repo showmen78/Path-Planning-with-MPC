@@ -186,6 +186,13 @@ class BehaviorPlannerPromptBuilder:
         forward_longitudinal_safe_distance_m: float,
         rear_longitudinal_safe_distance_m: float,
     ) -> int:
+        lane_exists = any(
+            int(waypoint.get("lane_id", -1)) == int(target_lane_id)
+            for waypoint in lane_center_waypoints
+        )
+        if not lane_exists:
+            return 0
+
         assumed_ego_snapshot = self._assumed_ego_snapshot_for_lane(
             ego_snapshot=ego_snapshot,
             lane_center_waypoints=lane_center_waypoints,

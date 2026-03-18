@@ -5,6 +5,7 @@ from .decision_logic import (
     BehaviorExecutionResult,
     BehaviorPlannerDecision,
     apply_behavior_planner_decision,
+    build_destination_on_lane,
     decision_from_mapping,
     parse_behavior_planner_response,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "BehaviorExecutionResult",
     "BehaviorPlannerDecision",
     "apply_behavior_planner_decision",
+    "build_destination_on_lane",
     "decision_from_mapping",
     "parse_behavior_planner_response",
     "AStarGlobalPlanner",
