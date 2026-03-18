@@ -13,7 +13,8 @@ import json
 import math
 from typing import Dict, List, Mapping, Sequence
 
-from .global_planner import AStarGlobalPlanner
+from MPC.local_goal import build_destination_on_lane as build_mpc_destination_on_lane
+from utility import AStarGlobalPlanner
 
 
 ALLOWED_BEHAVIOR_DECISIONS = {
@@ -125,18 +126,6 @@ def decision_from_mapping(data: Mapping[str, object] | None) -> BehaviorPlannerD
         raw_response_text=str(data.get("raw_response_text", "")),
     )
 
-
-def _position_of_waypoint(waypoint: Mapping[str, object]) -> tuple[float, float] | None:
-    position = waypoint.get("position", None)
-    if not isinstance(position, (list, tuple)) or len(position) < 2:
-        return None
-    return float(position[0]), float(position[1])
-
-
-def _waypoint_key(x_m: float, y_m: float) -> tuple[float, float]:
-    return round(float(x_m), 3), round(float(y_m), 3)
-
-
 def _lane_count_from_inputs(
     lane_center_waypoints: Sequence[Mapping[str, object]],
     road_cfg: Mapping[str, object] | None,
@@ -243,222 +232,6 @@ def _behavior_destination_distance_m(
     return float(max(1.0, float(lookahead_distance_m) + float(extra_buffer_m)))
 
 
-def _select_waypoint_ahead_on_lane(
-    lane_center_waypoints: Sequence[Mapping[str, object]],
-    ego_snapshot: Mapping[str, object],
-    target_lane_id: int,
-    target_distance_m: float,
-) -> List[float] | None:
-    lane_waypoints = [
-        waypoint
-        for waypoint in lane_center_waypoints
-        if int(waypoint.get("lane_id", -999999)) == int(target_lane_id)
-        and _position_of_waypoint(waypoint) is not None
-    ]
-    if len(lane_waypoints) == 0:
-        return None
-
-    ego_x_m = float(ego_snapshot.get("x", 0.0))
-    ego_y_m = float(ego_snapshot.get("y", 0.0))
-    ego_psi_rad = float(ego_snapshot.get("psi", 0.0))
-
-    def _waypoint_map(
-        waypoints: Sequence[Mapping[str, object]],
-    ) -> Dict[tuple[float, float], Mapping[str, object]]:
-        return {
-            _waypoint_key(float(position[0]), float(position[1])): waypoint
-            for waypoint in waypoints
-            if (position := _position_of_waypoint(waypoint)) is not None
-        }
-
-    def _best_segment_for_waypoints(
-        waypoints: Sequence[Mapping[str, object]],
-    ) -> tuple[Mapping[str, object], Mapping[str, object], float, float] | None:
-        waypoint_by_key_local = _waypoint_map(waypoints)
-        best_segment_local: tuple[Mapping[str, object], Mapping[str, object], float, float] | None = None
-        best_projection_distance_m_local = float("inf")
-
-        for waypoint in waypoints:
-            start_position = _position_of_waypoint(waypoint)
-            next_position_raw = waypoint.get("next", None)
-            if start_position is None or not isinstance(next_position_raw, (list, tuple)) or len(next_position_raw) < 2:
-                continue
-            next_waypoint = waypoint_by_key_local.get(
-                _waypoint_key(float(next_position_raw[0]), float(next_position_raw[1]))
-            )
-            if next_waypoint is None:
-                continue
-            end_position = _position_of_waypoint(next_waypoint)
-            if end_position is None:
-                continue
-
-            dx_m = float(end_position[0]) - float(start_position[0])
-            dy_m = float(end_position[1]) - float(start_position[1])
-            segment_length_sq = dx_m * dx_m + dy_m * dy_m
-            if segment_length_sq <= 1e-9:
-                continue
-
-            alpha = (
-                ((float(ego_x_m) - float(start_position[0])) * dx_m)
-                + ((float(ego_y_m) - float(start_position[1])) * dy_m)
-            ) / segment_length_sq
-            alpha = min(1.0, max(0.0, float(alpha)))
-            proj_x_m = float(start_position[0]) + float(alpha) * dx_m
-            proj_y_m = float(start_position[1]) + float(alpha) * dy_m
-            projection_distance_m = math.hypot(float(ego_x_m) - proj_x_m, float(ego_y_m) - proj_y_m)
-            if projection_distance_m < best_projection_distance_m_local:
-                best_projection_distance_m_local = float(projection_distance_m)
-                best_segment_local = (
-                    waypoint,
-                    next_waypoint,
-                    float(alpha),
-                    math.sqrt(segment_length_sq),
-                )
-
-        return best_segment_local
-
-    seed_waypoint = min(
-        lane_waypoints,
-        key=lambda waypoint: math.hypot(
-            float(_position_of_waypoint(waypoint)[0]) - ego_x_m,
-            float(_position_of_waypoint(waypoint)[1]) - ego_y_m,
-        ),
-    )
-    seed_position = _position_of_waypoint(seed_waypoint)
-    if seed_position is None:
-        return None
-
-    best_segment = _best_segment_for_waypoints(lane_waypoints)
-    if best_segment is not None:
-        current_waypoint = best_segment[0]
-        current_road_id = str(current_waypoint.get("road_id", ""))
-        current_direction = str(current_waypoint.get("direction", ""))
-        local_lane_waypoints = [
-            waypoint
-            for waypoint in lane_waypoints
-            if str(waypoint.get("road_id", "")) == current_road_id
-            and str(waypoint.get("direction", "")) == current_direction
-        ]
-        if len(local_lane_waypoints) > 0:
-            lane_waypoints = local_lane_waypoints
-            localized_best_segment = _best_segment_for_waypoints(lane_waypoints)
-            if localized_best_segment is not None:
-                best_segment = localized_best_segment
-
-    waypoint_by_key = _waypoint_map(lane_waypoints)
-
-    if best_segment is None:
-        return [
-            float(seed_position[0]),
-            float(seed_position[1]),
-            0.0,
-            float(seed_waypoint.get("heading_rad", ego_psi_rad)),
-        ]
-
-    current_waypoint, next_waypoint, current_alpha, current_segment_length_m = best_segment
-    current_position = _position_of_waypoint(current_waypoint)
-    next_position = _position_of_waypoint(next_waypoint)
-    if current_position is None or next_position is None:
-        return None
-
-    remaining_distance_m = max(0.0, float(target_distance_m))
-    distance_to_segment_end_m = max(0.0, (1.0 - float(current_alpha)) * float(current_segment_length_m))
-    if remaining_distance_m <= distance_to_segment_end_m and current_segment_length_m > 1e-9:
-        target_alpha = (
-            (float(current_alpha) * float(current_segment_length_m)) + float(remaining_distance_m)
-        ) / float(current_segment_length_m)
-        target_alpha = min(1.0, max(0.0, float(target_alpha)))
-        interp_x_m = float(current_position[0]) + target_alpha * (float(next_position[0]) - float(current_position[0]))
-        interp_y_m = float(current_position[1]) + target_alpha * (float(next_position[1]) - float(current_position[1]))
-        interp_heading_rad = math.atan2(
-            float(next_position[1]) - float(current_position[1]),
-            float(next_position[0]) - float(current_position[0]),
-        )
-        return [float(interp_x_m), float(interp_y_m), 0.0, float(interp_heading_rad)]
-
-    remaining_distance_m -= float(distance_to_segment_end_m)
-    current_waypoint = next_waypoint
-    visited_keys = {
-        _waypoint_key(float(current_position[0]), float(current_position[1])),
-    }
-
-    while True:
-        current_position = _position_of_waypoint(current_waypoint)
-        if current_position is None:
-            return None
-        current_key = _waypoint_key(float(current_position[0]), float(current_position[1]))
-        if current_key in visited_keys:
-            break
-        visited_keys.add(current_key)
-
-        next_position_raw = current_waypoint.get("next", None)
-        if not isinstance(next_position_raw, (list, tuple)) or len(next_position_raw) < 2:
-            break
-        next_waypoint = waypoint_by_key.get(
-            _waypoint_key(float(next_position_raw[0]), float(next_position_raw[1]))
-        )
-        if next_waypoint is None:
-            break
-        next_position = _position_of_waypoint(next_waypoint)
-        if next_position is None:
-            break
-
-        dx_m = float(next_position[0]) - float(current_position[0])
-        dy_m = float(next_position[1]) - float(current_position[1])
-        segment_length_m = math.hypot(dx_m, dy_m)
-        if segment_length_m <= 1e-9:
-            current_waypoint = next_waypoint
-            continue
-
-        if remaining_distance_m <= segment_length_m:
-            alpha = min(1.0, max(0.0, float(remaining_distance_m) / float(segment_length_m)))
-            interp_x_m = float(current_position[0]) + alpha * dx_m
-            interp_y_m = float(current_position[1]) + alpha * dy_m
-            interp_heading_rad = math.atan2(dy_m, dx_m)
-            return [float(interp_x_m), float(interp_y_m), 0.0, float(interp_heading_rad)]
-
-        remaining_distance_m -= float(segment_length_m)
-        current_waypoint = next_waypoint
-
-    final_position = _position_of_waypoint(current_waypoint)
-    if final_position is None:
-        return None
-    return [
-        float(final_position[0]),
-        float(final_position[1]),
-        0.0,
-        float(current_waypoint.get("heading_rad", ego_psi_rad)),
-    ]
-
-
-def build_destination_on_lane(
-    ego_snapshot: Mapping[str, object],
-    lane_center_waypoints: Sequence[Mapping[str, object]],
-    target_lane_id: int,
-    target_distance_m: float,
-    road_cfg: Mapping[str, object] | None = None,
-) -> List[float] | None:
-    """
-    Build a rolling temporary destination at a specified distance ahead of the
-    ego vehicle on the requested lane.
-    """
-
-    lane_count = _lane_count_from_inputs(
-        lane_center_waypoints=lane_center_waypoints,
-        road_cfg=road_cfg,
-    )
-    clamped_lane_id = min(
-        max(1, int(target_lane_id)),
-        max(1, int(lane_count)),
-    )
-    return _select_waypoint_ahead_on_lane(
-        lane_center_waypoints=lane_center_waypoints,
-        ego_snapshot=ego_snapshot,
-        target_lane_id=clamped_lane_id,
-        target_distance_m=float(target_distance_m),
-    )
-
-
 def apply_behavior_planner_decision(
     decision: BehaviorPlannerDecision | None,
     ego_snapshot: Mapping[str, object],
@@ -528,14 +301,27 @@ def apply_behavior_planner_decision(
         lane_center_waypoints=lane_center_waypoints,
         road_cfg=road_cfg,
     )
-    active_selected_lane_id = int(selected_lane_id) if selected_lane_id is not None else int(current_lane_id)
-    active_selected_lane_id = min(
-        max(1, int(active_selected_lane_id)),
-        max(1, int(lane_count)),
+    local_lane_ids = list(range(1, max(1, int(lane_count)) + 1))
+
+    def _clamp_lane_id_to_allowed(raw_lane_id: int | None) -> int:
+        if len(local_lane_ids) == 0:
+            return max(1, int(raw_lane_id or 1))
+        lane_id = int(raw_lane_id if raw_lane_id is not None else local_lane_ids[0])
+        if lane_id in local_lane_ids:
+            return int(lane_id)
+        return int(
+            min(
+                local_lane_ids,
+                key=lambda candidate_lane_id: abs(int(candidate_lane_id) - int(lane_id)),
+            )
+        )
+
+    active_selected_lane_id = _clamp_lane_id_to_allowed(
+        selected_lane_id if selected_lane_id is not None else current_lane_id
     )
 
     def _destination_on_lane(target_lane_id: int, target_distance_m: float) -> List[float] | None:
-        return build_destination_on_lane(
+        return build_mpc_destination_on_lane(
             ego_snapshot=ego_snapshot,
             lane_center_waypoints=lane_center_waypoints,
             target_lane_id=int(target_lane_id),
@@ -544,18 +330,19 @@ def apply_behavior_planner_decision(
         )
 
     def _candidate_lane_after_change(raw_lane_delta: int) -> int:
-        return min(
-            max(1, int(active_selected_lane_id) + int(raw_lane_delta)),
-            max(1, int(lane_count)),
+        if len(local_lane_ids) == 0:
+            return int(active_selected_lane_id)
+        anchor_lane_id = _clamp_lane_id_to_allowed(active_selected_lane_id)
+        anchor_index = local_lane_ids.index(int(anchor_lane_id))
+        lane_step = 1 if int(raw_lane_delta) > 0 else -1 if int(raw_lane_delta) < 0 else 0
+        candidate_index = min(
+            max(0, int(anchor_index) + int(lane_step)),
+            len(local_lane_ids) - 1,
         )
+        return int(local_lane_ids[int(candidate_index)])
 
     def _try_lane_change(raw_lane_delta: int) -> tuple[int, List[float] | None]:
         candidate_lane_id = _candidate_lane_after_change(raw_lane_delta=raw_lane_delta)
-        if abs(int(candidate_lane_id) - int(current_lane_id)) > 1:
-            return int(active_selected_lane_id), _destination_on_lane(
-                target_lane_id=int(active_selected_lane_id),
-                target_distance_m=active_target_distance_m,
-            )
         candidate_destination = _destination_on_lane(
             target_lane_id=int(candidate_lane_id),
             target_distance_m=active_target_distance_m,
@@ -572,9 +359,8 @@ def apply_behavior_planner_decision(
         destination_state = list(final_destination_state)
         destination_state[2] = 0.0
     elif behavior in {"LANE_KEEP", "GO_STRAIGHT"}:
-        active_selected_lane_id = int(current_lane_id)
         lane_keep_destination = _destination_on_lane(
-            target_lane_id=int(current_lane_id),
+            target_lane_id=int(active_selected_lane_id),
             target_distance_m=active_target_distance_m,
         )
         if lane_keep_destination is not None:
@@ -636,7 +422,14 @@ def apply_behavior_planner_decision(
         # Until CARLA/OpenDRIVE intersection-road routing is integrated, best
         # effort is to bias the temporary destination toward the left-adjacent
         # branch/lane at the current lookahead.
-        target_lane_id, lane_change_destination = _try_lane_change(raw_lane_delta=1)
+        if previous_applied_behavior == "TURN_LEFT":
+            target_lane_id = int(active_selected_lane_id)
+            lane_change_destination = _destination_on_lane(
+                target_lane_id=int(active_selected_lane_id),
+                target_distance_m=active_target_distance_m,
+            )
+        else:
+            target_lane_id, lane_change_destination = _try_lane_change(raw_lane_delta=1)
         if lane_change_destination is not None:
             destination_state = lane_change_destination
         active_selected_lane_id = int(target_lane_id)
@@ -645,7 +438,14 @@ def apply_behavior_planner_decision(
         # Until CARLA/OpenDRIVE intersection-road routing is integrated, best
         # effort is to bias the temporary destination toward the right-adjacent
         # branch/lane at the current lookahead.
-        target_lane_id, lane_change_destination = _try_lane_change(raw_lane_delta=-1)
+        if previous_applied_behavior == "TURN_RIGHT":
+            target_lane_id = int(active_selected_lane_id)
+            lane_change_destination = _destination_on_lane(
+                target_lane_id=int(active_selected_lane_id),
+                target_distance_m=active_target_distance_m,
+            )
+        else:
+            target_lane_id, lane_change_destination = _try_lane_change(raw_lane_delta=-1)
         if lane_change_destination is not None:
             destination_state = lane_change_destination
         active_selected_lane_id = int(target_lane_id)

@@ -1,0 +1,265 @@
+SYSTEM INSTRUCTION:
+You are the high-level Behavior Planner for an autonomous vehicle (Ego). 
+Your job is to read the current state of the environment, HD Map, Global Route, predicted intentions, and V2X broadcasts, then output a strict JSON response.
+Safety and "emergency" broadcasts supersede all other routing goals.
+
+ALLOWED BEHAVIORS: 
+["LANE_KEEP", "LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT", "ACCELERATE", "DECELERATE", "STOP_AT_LINE", "EMERGENCY_BRAKE"]
+
+1. EGO VEHICLE STATE:
+- State [x, y, v, psi]: {ego_x}, {ego_y}, {ego_v} m/s, {ego_psi} rad
+- Current Road ID: {ego_road_id}, Lane ID: {ego_lane_id} (e.g., 1)
+
+2. GLOBAL ROUTE PLAN (A* Navigation):
+- Distance to Destination: {dist_to_dest} km
+- Next Macro Maneuver: {a_star_next_maneuver}
+- Optimal Lane for Route: {a_star_optimal_lane} (e.g., 1)
+
+3. CARLA HD MAP CONTEXT:
+- Speed Limit: {speed_limit} m/s
+- Legal Lane Changes: [Left (Lane 0): {can_change_left}, Right (Lane 2): {can_change_right}]
+- Next Traffic Light State: {traffic_light_state} (Distance: {dist_to_light} m)
+
+4. SURROUNDING VEHICLES & PREDICTED INTENTIONS:
+- Vehicle ID: {v1_id} (Ahead in Ego Lane 1)
+  - State [x, y, v, psi]: {v1_x}, {v1_y}, {v1_v} m/s, {v1_psi} rad
+  - Potential Field Risk: {v1_risk_level}
+  - Predicted Intention: "slowing down, maintaining lane 1"
+  
+- Vehicle ID: {v2_id} (Adjacent in Right Lane 2)
+  - State [x, y, v, psi]: {v2_x}, {v2_y}, {v2_v} m/s, {v2_psi} rad
+  - Potential Field Risk: {v2_risk_level}
+  - Predicted Intention: "speeding up, will change lane from 2 to 1"
+
+5. V2X/CAV BROADCASTS (Received):
+[
+  {"id": {v1_id}, "type": "normal", "message": "Applying brakes for traffic light."},
+  {"id": {v3_id}, "type": "emergency", "message": "Ambulance approaching from behind. Clear Lane 1."}
+]
+
+TASK:
+Determine the safest ALLOWED BEHAVIOR. 
+Provide a target_v (target speed in m/s), the chosen behavior, a message dictionary to broadcast to other CAVs, and a brief reasoning.
+
+EXPECTED JSON FORMAT:
+{
+  "behavior": "BEHAVIOR_NAME",
+  "target_v": 0.0,
+  "cav_broadcast": {
+    "id": "vehicle_id"
+    "type": "normal/emergency",
+    "message": "Your broadcast message here"
+  },
+  "reasoning": "Explanation here"
+}
+
+
+
+#==============================================================================================
+
+SYSTEM INSTRUCTION:
+You are the high-level Behavior Planner for an autonomous vehicle (Ego). 
+Your job is to read the current state of the environment, HD Map, Global Route, predicted intentions, and V2X broadcasts, then output a strict JSON response.
+Safety and "emergency" broadcasts supersede all other routing goals.
+
+ALLOWED BEHAVIORS: 
+["LANE_KEEP", "LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT", "ACCELERATE", "DECELERATE", "STOP_AT_LINE", "EMERGENCY_BRAKE"]
+
+1. EGO VEHICLE STATE:
+- State [x, y, v, psi]: 100.0, 10.5, 15.0 m/s, 0.0 rad
+- Current Road ID: 12, Lane ID: 3 (Right-most lane)
+
+2. GLOBAL ROUTE PLAN :
+- Distance to Destination: 5.2 km
+- Next Macro Maneuver: "Continue Straight"
+- Optimal Lane for Route: 3
+
+3. CARLA HD MAP CONTEXT:
+- Speed Limit: 20.0 m/s
+- Legal Lane Changes: [Left: True, Right: False]
+- Next Traffic Light State: Green (Distance: 400.0 m)
+- Map Warning: Static blockage in Lane 3 at distance 100.0 m.
+
+4. SURROUNDING VEHICLES & PREDICTED INTENTIONS:
+- Vehicle ID: 101 
+  - State [x, y, v, psi]: 102.0, 7.0, 15.0 m/s, 0.0 rad
+  - Potential Field Risk: Warning Zone (Blocking left lane change)
+  - Predicted Intention: "Maintaining lane 2, steady speed"
+
+5. V2X/CAV BROADCASTS (Received):
+[
+  {"id": 101, "type": "normal", "message": "Maintaining speed at 15 m/s."}
+]
+
+TASK:
+Determine the safest ALLOWED BEHAVIOR. 
+Provide a target_v (target speed in m/s), the chosen behavior, a message dictionary to broadcast to other CAVs, and a brief reasoning.
+
+EXPECTED JSON FORMAT:
+{
+  "behavior": "BEHAVIOR_NAME",
+  "target_v": 0.0,
+  "cav_broadcast": {
+    "id": "vehicle_id"
+    "type": "normal/emergency",
+    "message": "Your broadcast message here"
+  },
+  "reasoning": "Explanation here"
+}
+
+
+Response:"
+{
+  "behavior": "DECELERATE",
+  "target_v": 10.0,
+  "cav_broadcast": {
+    "id": "Ego",
+    "type": "normal",
+    "message": "Decelerating to yield to Vehicle 101. Preparing to merge into Lane 2 to avoid obstacle."
+  },
+  "reasoning": "There is a static blockage 100 meters ahead in the current lane (Lane 3). Ego must transition to Lane 2, but Vehicle 101 is currently occupying the adjacent space in the Warning Zone at the same speed (15 m/s). Ego must decelerate to fall behind Vehicle 101, opening up a safe gap to execute a LANE_CHANGE_LEFT in the near future."
+}
+
+
+"
+
+
+
+#===========================================================================================
+SYSTEM INSTRUCTION:
+You are the high-level Behavior Planner for an autonomous vehicle (Ego). 
+Your job is to read the current state of the environment, HD Map, Global Route, predicted intentions, and V2X broadcasts, then output a strict JSON response.
+Safety and "emergency" broadcasts supersede all other routing goals.
+
+ALLOWED BEHAVIORS: 
+["LANE_KEEP", "LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT", "ACCELERATE", "DECELERATE", "STOP_AT_LINE", "EMERGENCY_BRAKE"]
+
+1. EGO VEHICLE STATE:
+- State [x, y, v, psi]: 250.0, 0.0, 20.0 m/s, 0.0 rad
+- Current Road ID: 15, Lane ID: 0 
+
+2. GLOBAL ROUTE PLAN :
+- Distance to Destination: 8.5 km
+- Next Macro Maneuver: "Continue Straight"
+- Optimal Lane for Route: 0
+
+3. CARLA HD MAP CONTEXT:
+- Speed Limit: 25.0 m/s
+- Legal Lane Changes: [Left: False, Right: True]
+- Next Traffic Light State: None 
+
+4. SURROUNDING VEHICLES & PREDICTED INTENTIONS:
+- Vehicle ID: 205 (Slightly ahead in Right Lane 1)
+  - State [x, y, v, psi]: 265.0, 3.5, 18.0 m/s, 0.1 rad
+  - Potential Field Risk: Warning Zone
+  - Predicted Intention: "Speeding up, will change lane from 1 to 0"
+
+5. V2X/CAV BROADCASTS (Received):
+[
+  {"id": 205, "type": "normal", "message": "Initiating lane change to Lane 0 to pass slower traffic."}
+]
+
+TASK:
+Determine the safest ALLOWED BEHAVIOR. 
+Provide a target_v (target speed in m/s), the chosen behavior, a message dictionary to broadcast to other CAVs, and a brief reasoning.
+
+EXPECTED JSON FORMAT:
+{
+  "behavior": "BEHAVIOR_NAME",
+  "target_v": 0.0,
+  "cav_broadcast": {
+    "id": "vehicle_id"
+    "type": "normal/emergency",
+    "message": "Your broadcast message here"
+  },
+  "reasoning": "Explanation here"
+}
+
+
+response:"
+{
+  "behavior": "DECELERATE",
+  "target_v": 15.0,
+  "cav_broadcast": {
+    "id": "Ego",
+    "type": "normal",
+    "message": "Acknowledged Vehicle 205 merge intent. Decelerating to open a safe gap in Lane 0."
+  },
+  "reasoning": "Vehicle 205 is 15 meters ahead in Lane 1, has entered the potential field Warning Zone, and broadcasted its intent to cut into Lane 0. Since Ego is traveling faster (20 m/s) than Vehicle 205 (18 m/s), maintaining speed would risk a collision. Ego will decelerate to yield the space, allowing Vehicle 205 to safely merge while Ego remains in its A* optimal lane."
+}
+
+
+
+"
+
+
+#=================================================================================================
+
+SYSTEM INSTRUCTION:
+You are the high-level Behavior Planner for an autonomous vehicle (Ego). 
+Your job is to read the current state of the environment, HD Map, Global Route, predicted intentions, and V2X broadcasts, then output a strict JSON response.
+Safety and "emergency" broadcasts supersede all other routing goals.
+
+ALLOWED BEHAVIORS: 
+["LANE_KEEP", "LANE_CHANGE_LEFT", "LANE_CHANGE_RIGHT", "ACCELERATE", "DECELERATE", "STOP_AT_LINE", "EMERGENCY_BRAKE"]
+
+1. EGO VEHICLE STATE:
+- State [x, y, v, psi]: 500.0, 0.0, 18.0 m/s, 0.0 rad
+- Current Road ID: 22, Lane ID: 0 (Left-most lane)
+
+2. GLOBAL ROUTE PLAN :
+- Distance to Destination: 3.0 km
+- Next Macro Maneuver: "Left Turn at next intersection"
+- Optimal Lane for Route: 0
+
+3. CARLA HD MAP CONTEXT:
+- Speed Limit: 20.0 m/s
+- Legal Lane Changes: [Left: False, Right: True]
+- Next Traffic Light State: Green (Distance: 800.0 m)
+
+4. SURROUNDING VEHICLES & PREDICTED INTENTIONS:
+- Vehicle ID: 301 (Ahead in Ego Lane 0)
+  - State [x, y, v, psi]: 530.0, 0.0, 18.0 m/s, 0.0 rad
+  - Potential Field Risk: Safe Zone
+  - Predicted Intention: "Maintaining lane 0, steady speed"
+  
+- Vehicle ID: 911 (Ambulance - Far behind in Ego Lane 0)
+  - State [x, y, v, psi]: 300.0, 0.0, 35.0 m/s, 0.0 rad
+  - Potential Field Risk: Safe Zone (but closing rapidly)
+  - Predicted Intention: "High speed, maintaining lane 0"
+
+5. V2X/CAV BROADCASTS (Received):
+[
+  {"id": 301, "type": "normal", "message": "Cruising at 18 m/s."},
+  {"id": 911, "type": "emergency", "message": "Ambulance responding to code 3. Clear Lane 0 immediately!"}
+]
+
+TASK:
+Determine the safest ALLOWED BEHAVIOR. 
+Provide a target_v (target speed in m/s), the chosen behavior, a message dictionary to broadcast to other CAVs, and a brief reasoning.
+
+EXPECTED JSON FORMAT:
+{
+  "behavior": "BEHAVIOR_NAME",
+  "target_v": 0.0,
+  "cav_broadcast": {
+    "id": "vehicle_id"
+    "type": "normal/emergency",
+    "message": "Your broadcast message here"
+  },
+  "reasoning": "Explanation here"
+}
+
+response: "
+{
+  "behavior": "LANE_CHANGE_RIGHT",
+  "target_v": 18.0,
+  "cav_broadcast": {
+    "id": "Ego",
+    "type": "normal",
+    "message": "Yielding to emergency vehicle 911. Executing lane change to Lane 1."
+  },
+  "reasoning": "Received an emergency broadcast from Vehicle 911 (Ambulance) approaching rapidly from behind in Lane 0. Emergency protocols supersede the A* global route preference for Lane 0. Lane 1 is clear, so executing an immediate right lane change to yield."
+}
+
+"

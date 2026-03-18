@@ -1,15 +1,13 @@
-"""Behavior-planner prompt creation package."""
+"""Behavior-planner package exports."""
 
 from .api_client import BehaviorPlannerAPIClient
 from .decision_logic import (
     BehaviorExecutionResult,
     BehaviorPlannerDecision,
     apply_behavior_planner_decision,
-    build_destination_on_lane,
     decision_from_mapping,
     parse_behavior_planner_response,
 )
-from .global_planner import AStarGlobalPlanner, RoutePlanSummary
 from .intention import (
     SurroundingVehicleSummary,
     compute_safe_zone_distance,
@@ -23,11 +21,8 @@ __all__ = [
     "BehaviorExecutionResult",
     "BehaviorPlannerDecision",
     "apply_behavior_planner_decision",
-    "build_destination_on_lane",
     "decision_from_mapping",
     "parse_behavior_planner_response",
-    "AStarGlobalPlanner",
-    "RoutePlanSummary",
     "SurroundingVehicleSummary",
     "compute_safe_zone_distance",
     "infer_vehicle_intention",

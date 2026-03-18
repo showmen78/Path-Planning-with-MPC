@@ -1,5 +1,5 @@
 name: workzone
-runner_module: carla_scenario.test_scenario.custom_map4_runner
+runner_module: carla_scenario.runner
 
 carla:
   host: 127.0.0.1
@@ -35,15 +35,15 @@ constraints:
   min_acceleration_mps2: -10.0
   max_acceleration_mps2: 3.0
   max_jerk_mps3: 10.0
-  min_steer_rad: -0.6
+  min_steer_rad: -0.6 #0.6
   max_steer_rad: 0.6
   min_steer_rate_rps: -0.3
   max_steer_rate_rps: 0.3
-  enforce_terminal_velocity_constraint: false
+  enforce_terminal_velocity_constraint: true
   terminal_velocity_mps: 0.0
 
 planning:
-  waypoint_sample_distance_m: 2.0
+  waypoint_sample_distance_m: 1.0
   route_rebuild_period_s: 1.0
   prompt_period_s: 1.0
 

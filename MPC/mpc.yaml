@@ -7,13 +7,14 @@ mpc:
   # MPC discretization step [s].
   # Increase -> fewer horizon steps and faster solve, but rougher dynamics.
   # Decrease -> finer dynamics and smoother planning, but larger QP size.
-  # main.py currently syncs this with simulation.dt_s at runtime.
-  plan_dt_s: 0.05
+  # The CARLA scenario runner overrides this with CARLA fixed_delta_seconds at
+  # runtime so the planner and simulator use the same step.
+  plan_dt_s: 0.1 #0.05
 
   # Replan frequency [Hz].
   # Increase -> fresher plans and better reaction to moving objects, but more
   # compute cost. Decrease -> cheaper runtime, but plans can go stale.
-  trajectory_generation_frequency_hz: 2.0
+  trajectory_generation_frequency_hz: 2.0 #2
 
   # Runtime behavior-planner loop for the LLM. This loop is separate from the
   # MPC replan loop. It builds prompts, optionally calls the API, and caches
@@ -90,7 +91,7 @@ mpc:
     # Speed reference [m/s] attached to rolling temporary destinations.
     # Increase -> temporary goals encourage more aggressive cruising.
     # Decrease -> temporary goals become more conservative.
-    v_ref_mps: 5.0
+    v_ref_mps: 20.0
 
     # Extra forward buffer [m] added on top of the current lookahead distance
     # when the behavior planner rebuilds the temporary destination position on
@@ -98,7 +99,7 @@ mpc:
     # Effective target distance = lookahead distance + this buffer.
     # Increase -> temporary destination is placed farther ahead.
     # Decrease -> temporary destination stays closer to the ego.
-    behavior_destination_distance_buffer_m: 0.0
+    behavior_destination_distance_buffer_m: 0.0 #10
 
     # Enable dynamic lookahead distance for the temporary destination. When
     # enabled, the target distance is:
@@ -121,24 +122,24 @@ mpc:
     # collapse too close to the ego at very low speed.
     # Increase -> even at low speed the temporary goal stays farther ahead.
     # Decrease -> more reactive, near-term temporary goals.
-    dynamic_lookahead_min_distance_m: 20.0
+    dynamic_lookahead_min_distance_m: 10.0 #30
 
     # d_max in the dynamic lookahead equation above.
     # Increase -> allow farther temporary goals on fast/straight segments.
     # Decrease -> cap the temporary goal closer to the ego.
-    dynamic_lookahead_max_distance_m: 100.0
+    dynamic_lookahead_max_distance_m: 100.0 #60
 
     # k_v in:
     #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
     # Increase -> lookahead grows faster with ego speed.
     # Decrease -> speed has less effect on lookahead distance.
-    dynamic_lookahead_speed_gain: 4 #3
+    dynamic_lookahead_speed_gain: 3 #3
 
     # k_c in:
     #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
     # Increase -> curvature shortens lookahead more aggressively.
     # Decrease -> curved-road penalty becomes weaker.
-    dynamic_lookahead_curvature_gain: 10.0
+    dynamic_lookahead_curvature_gain: 1.0
 
     # Distance [m] between the three forward samples used to estimate
     # curvature with:
@@ -147,7 +148,7 @@ mpc:
     # points ahead of the ego.
     # Increase -> smoother, more global curvature estimate.
     # Decrease -> more local, more sensitive curvature estimate.
-    dynamic_lookahead_curvature_sample_spacing_m: 10.0
+    dynamic_lookahead_curvature_sample_spacing_m: 5.0
 
     # Lock the temporary destination to the real final destination when the
     # temporary goal is this close [m] to the final stop/goal point.
@@ -231,7 +232,7 @@ mpc:
     # Number of sequential linearization / solve passes per replan.
     # Increase -> better local nonlinear consistency, but more CPU time.
     # Decrease -> faster replans, but more dependence on the initial guess.
-    sequential_linearization_iterations: 2
+    sequential_linearization_iterations: 1 #2
 
     # Apply a simple lead-obstacle speed heuristic inside the rollout seed.
     # This only changes the guessed speed profile; the real obstacle avoidance
@@ -281,7 +282,7 @@ mpc:
       # Decrease a component -> less importance for that channel.
       q_x: 0 #10
       q_y: 0
-      q_v: 10.0 #1
+      q_v: 20.0 #10
       q_psi: 0.0
 
     lane_center_follow:
@@ -317,7 +318,7 @@ mpc:
       # Increase -> smoother change in that actuator.
       # Decrease -> faster actuator changes allowed.
       q_a: 5.0 #10
-      q_delta: 10 #50
+      q_delta: 50 #10
 
     # Super-ellipsoid obstacle potential used in the live MPC objective.
     #

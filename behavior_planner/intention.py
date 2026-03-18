@@ -13,8 +13,7 @@ import math
 import os
 from typing import Mapping, Sequence
 
-from .global_planner import AStarGlobalPlanner
-from utility import load_yaml_file
+from utility import AStarGlobalPlanner, load_yaml_file
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

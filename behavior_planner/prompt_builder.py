@@ -16,11 +16,11 @@ import math
 import os
 from typing import List, Mapping, Sequence
 
-from .global_planner import AStarGlobalPlanner, RoutePlanSummary
 from .intention import (
     SurroundingVehicleSummary,
     summarize_surrounding_vehicle,
 )
+from utility import AStarGlobalPlanner, RoutePlanSummary
 
 
 ALLOWED_BEHAVIORS = [
@@ -44,6 +44,7 @@ class BehaviorPlannerPromptContext:
     """Structured runtime data used to build the compact prompt lines."""
 
     ego_lane_id: int
+    ego_lane_count: int
     can_change_left: bool
     can_change_right: bool
     temporary_destination_lane_id: int
@@ -372,6 +373,18 @@ class BehaviorPlannerPromptBuilder:
 
         return BehaviorPlannerPromptContext(
             ego_lane_id=ego_lane_id,
+            ego_lane_count=max(
+                1,
+                int(
+                    road_cfg.get(
+                        "lane_count",
+                        self._lane_count_from_inputs(
+                            lane_center_waypoints=lane_center_waypoints,
+                            road_cfg=road_cfg,
+                        ),
+                    )
+                ),
+            ),
             can_change_left=bool(local_context.get("can_change_left", False)),
             can_change_right=bool(local_context.get("can_change_right", False)),
             temporary_destination_lane_id=int(destination_lane_context.get("lane_id", -1)),
@@ -415,10 +428,7 @@ class BehaviorPlannerPromptBuilder:
             road_cfg=road_cfg,
             behavior_planner_runtime_cfg=behavior_planner_runtime_cfg,
         )
-        lane_count = self._lane_count_from_inputs(
-            lane_center_waypoints=lane_center_waypoints,
-            road_cfg=road_cfg,
-        )
+        lane_count = max(1, int(context.ego_lane_count))
 
         ego_x_m = float(ego_snapshot.get("x", 0.0))
         ego_y_m = float(ego_snapshot.get("y", 0.0))
