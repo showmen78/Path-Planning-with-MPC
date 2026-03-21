@@ -1,13 +1,4 @@
-"""
-Behavior-planner prompt builder.
-
-This module now follows the compact prompt format defined in
-`behavior_planner/system_instruction.txt`.
-
-Runtime behavior:
-- the system instruction text is sent once at startup
-- afterwards only the compact environment input prompt is generated
-"""
+"""Behavior-planner prompt builder."""
 
 from __future__ import annotations
 
@@ -27,10 +18,8 @@ ALLOWED_BEHAVIORS = [
     "LANE_KEEP",
     "LANE_CHANGE_LEFT",
     "LANE_CHANGE_RIGHT",
+    "STOP",
     "EMERGENCY_BRAKE",
-    "GO_STRAIGHT",
-    "TURN_LEFT",
-    "TURN_RIGHT",
 ]
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,17 +30,17 @@ DEFAULT_LANE_SAFE_REAR_LONGITUDINAL_DISTANCE_M = 20.0
 
 @dataclass
 class BehaviorPlannerPromptContext:
-    """Structured runtime data used to build the compact prompt lines."""
+    """Structured runtime data used to build the prompt lines."""
 
     ego_lane_id: int
     ego_lane_count: int
-    can_change_left: bool
-    can_change_right: bool
-    temporary_destination_lane_id: int
-    temporary_next_macro_maneuver: str
+    maneuver_possible: int
     lane_safe_current: int
     lane_safe_left: int
     lane_safe_right: int
+    route_next_maneuver: str
+    distance_to_signal_m: float
+    signal_phase_code: str
     route_summary: RoutePlanSummary
     surrounding_vehicles: List[SurroundingVehicleSummary]
 
@@ -116,6 +105,50 @@ class BehaviorPlannerPromptBuilder:
         if "right turn" in lowered or lowered == "right":
             return "R"
         return "S"
+
+    @classmethod
+    def _route_next_maneuver_code(cls, route_summary: RoutePlanSummary) -> str:
+        road_options = [str(option).strip().upper() for option in list(getattr(route_summary, "road_options", []) or [])]
+        for option_name in road_options:
+            if option_name == "LEFT":
+                return "L"
+            if option_name == "RIGHT":
+                return "R"
+        for option_name in road_options:
+            if option_name == "STRAIGHT":
+                return "S"
+        return cls._macro_maneuver_code(str(route_summary.next_macro_maneuver))
+
+    @staticmethod
+    def _signal_phase_code(road_cfg: Mapping[str, object]) -> str:
+        _ = road_cfg
+        return "G"
+
+    @staticmethod
+    def _simplify_intention_code(predicted_intention: str) -> str:
+        normalized = str(predicted_intention or "").strip().upper()
+        if normalized == "S":
+            return "S"
+        if normalized.startswith("L"):
+            return "L"
+        if normalized.startswith("R"):
+            return "R"
+        if normalized.endswith("B"):
+            return "B"
+        if normalized.endswith("A"):
+            return "A"
+        return "K"
+
+    @staticmethod
+    def _participant_type_code(vehicle_snapshot: Mapping[str, object]) -> int:
+        raw_type = str(vehicle_snapshot.get("type", "")).strip().lower()
+        raw_vehicle_id = str(vehicle_snapshot.get("vehicle_id", "")).strip().lower()
+        combined = f"{raw_type} {raw_vehicle_id}"
+        if any(keyword in combined for keyword in ("ambulance", "police", "fire", "rescue", "emergency")):
+            return 1
+        if any(keyword in combined for keyword in ("pedestrian", "walker", "cyclist", "bicycle", "bike", "vru")):
+            return 2
+        return 0
 
     @staticmethod
     def _stopping_distance_m(speed_mps: float, min_acceleration_mps2: float) -> float:
@@ -238,10 +271,7 @@ class BehaviorPlannerPromptBuilder:
         return 1
 
     def load_system_instruction(self) -> str:
-        """
-        Return the system instruction exactly as authored, excluding the example
-        input block at the end of the file.
-        """
+        """Return the system instruction text as authored."""
 
         with open(SYSTEM_INSTRUCTION_PATH, "r", encoding="utf-8") as handle:
             full_text = handle.read()
@@ -260,12 +290,14 @@ class BehaviorPlannerPromptBuilder:
         object_snapshots: Sequence[Mapping[str, object]],
         road_cfg: Mapping[str, object] | None = None,
         behavior_planner_runtime_cfg: Mapping[str, object] | None = None,
+        planner: AStarGlobalPlanner | None = None,
+        route_summary: RoutePlanSummary | None = None,
     ) -> BehaviorPlannerPromptContext:
-        """Build the structured runtime data needed for the compact prompt."""
+        """Build the structured runtime data needed for the prompt."""
 
         road_cfg = dict(road_cfg or {})
         behavior_planner_runtime_cfg = dict(behavior_planner_runtime_cfg or {})
-        planner = AStarGlobalPlanner(lane_center_waypoints=lane_center_waypoints)
+        planner = planner or AStarGlobalPlanner(lane_center_waypoints=lane_center_waypoints)
 
         ego_x_m = float(ego_snapshot.get("x", 0.0))
         ego_y_m = float(ego_snapshot.get("y", 0.0))
@@ -276,28 +308,21 @@ class BehaviorPlannerPromptBuilder:
             y_m=float(ego_y_m),
             heading_rad=float(ego_psi_rad),
         )
-        route_summary = planner.plan_route(
-            start_xy=[float(ego_x_m), float(ego_y_m)],
-            goal_xy=list(destination_state[:2]) if len(destination_state) >= 2 else [ego_x_m, ego_y_m],
-        )
         temporary_destination_state = (
             list(temporary_destination_state)
             if temporary_destination_state is not None
-            else list(destination_state)
+            else None
         )
-        temporary_route_summary = planner.plan_route(
-            start_xy=[float(ego_x_m), float(ego_y_m)],
-            goal_xy=(
-                list(temporary_destination_state[:2])
-                if len(temporary_destination_state) >= 2
-                else [ego_x_m, ego_y_m]
-            ),
+        route_start_xy = (
+            list(temporary_destination_state[:2])
+            if temporary_destination_state is not None and len(temporary_destination_state) >= 2
+            else [float(ego_x_m), float(ego_y_m)]
         )
-        destination_lane_context = planner.get_local_lane_context(
-            x_m=float(temporary_destination_state[0]) if len(temporary_destination_state) >= 1 else float(ego_x_m),
-            y_m=float(temporary_destination_state[1]) if len(temporary_destination_state) >= 2 else float(ego_y_m),
-            heading_rad=float(temporary_destination_state[3]) if len(temporary_destination_state) >= 4 else float(ego_psi_rad),
-        )
+        if route_summary is None:
+            route_summary = planner.plan_route(
+                start_xy=route_start_xy,
+                goal_xy=list(destination_state[:2]) if len(destination_state) >= 2 else [ego_x_m, ego_y_m],
+            )
         lane_width_m = float(road_cfg.get("lane_width_m", 4.0))
         forward_longitudinal_safe_buffer_m = max(
             0.0,
@@ -320,13 +345,7 @@ class BehaviorPlannerPromptBuilder:
                 )
             ),
         )
-        forward_longitudinal_safe_distance_m = 0.0
-        if len(temporary_destination_state) >= 2:
-            forward_longitudinal_safe_distance_m = math.hypot(
-                float(temporary_destination_state[0]) - float(ego_x_m),
-                float(temporary_destination_state[1]) - float(ego_y_m),
-            )
-        forward_longitudinal_safe_distance_m += float(forward_longitudinal_safe_buffer_m)
+        forward_longitudinal_safe_distance_m = float(forward_longitudinal_safe_buffer_m)
         ego_lane_id = int(local_context.get("lane_id", -1))
         lane_safe_current = self._lane_safe_flag(
             ego_snapshot=ego_snapshot,
@@ -371,6 +390,15 @@ class BehaviorPlannerPromptBuilder:
             for vehicle_snapshot in object_snapshots
         ]
 
+        route_next_maneuver = self._route_next_maneuver_code(route_summary)
+        maneuver_possible = 1
+        if (
+            int(route_summary.optimal_lane_id) > 0
+            and int(ego_lane_id) > 0
+            and str(route_next_maneuver) in {"L", "R"}
+        ):
+            maneuver_possible = int(int(route_summary.optimal_lane_id) == int(ego_lane_id))
+
         return BehaviorPlannerPromptContext(
             ego_lane_id=ego_lane_id,
             ego_lane_count=max(
@@ -385,13 +413,13 @@ class BehaviorPlannerPromptBuilder:
                     )
                 ),
             ),
-            can_change_left=bool(local_context.get("can_change_left", False)),
-            can_change_right=bool(local_context.get("can_change_right", False)),
-            temporary_destination_lane_id=int(destination_lane_context.get("lane_id", -1)),
-            temporary_next_macro_maneuver=str(temporary_route_summary.next_macro_maneuver),
+            maneuver_possible=int(maneuver_possible),
             lane_safe_current=int(lane_safe_current),
             lane_safe_left=int(lane_safe_left),
             lane_safe_right=int(lane_safe_right),
+            route_next_maneuver=str(route_next_maneuver),
+            distance_to_signal_m=1000.0,
+            signal_phase_code=str(self._signal_phase_code(road_cfg)),
             route_summary=route_summary,
             surrounding_vehicles=surrounding_summaries,
         )
@@ -410,11 +438,10 @@ class BehaviorPlannerPromptBuilder:
         mpc_constraints: Mapping[str, object] | None = None,
         prompt_id: str | int | None = None,
         previous_behavior: str = "LANE_KEEP",
+        planner: AStarGlobalPlanner | None = None,
+        route_summary: RoutePlanSummary | None = None,
     ) -> str:
-        """
-        Build the compact environment-input prompt expected after the system
-        instruction has already been sent.
-        """
+        """Build the environment-input prompt expected by the current system instruction."""
 
         road_cfg = dict(road_cfg or {})
         mpc_constraints = dict(mpc_constraints or {})
@@ -427,6 +454,8 @@ class BehaviorPlannerPromptBuilder:
             object_snapshots=object_snapshots,
             road_cfg=road_cfg,
             behavior_planner_runtime_cfg=behavior_planner_runtime_cfg,
+            planner=planner,
+            route_summary=route_summary,
         )
         lane_count = max(1, int(context.ego_lane_count))
 
@@ -441,50 +470,46 @@ class BehaviorPlannerPromptBuilder:
 
         lines = []
         if prompt_id is not None:
-            lines.extend([f"ID:[{str(prompt_id)}]", ""])
-
+            lines.append(f"ID: {int(prompt_id)}")
         lines.extend([
             (
-                f"{ego_vehicle_id}:["
+                "ego = ["
                 f"{self._format_numeric(ego_x_m)},"
                 f"{self._format_numeric(ego_y_m)},"
                 f"{self._format_numeric(ego_v_mps)},"
                 f"{self._format_numeric(ego_psi_rad, decimals=6)},"
-                f"{ego_lane_prompt}]"
+                f"{ego_lane_prompt},"
+                f"{int(context.maneuver_possible)}]"
             ),
-            "",
             (
-                "ROUTE:["
+                "lane = ["
                 f"{int(context.lane_safe_left)},"
                 f"{int(context.lane_safe_current)},"
                 f"{int(context.lane_safe_right)}]"
             ),
-            "",
-            f"PREV:[{str(previous_behavior or 'LANE_KEEP').strip().upper()}]",
+            (
+                "route = ["
+                f"{str(context.route_next_maneuver)},"
+                f"{self._format_numeric(float(context.distance_to_signal_m))},"
+                f"{str(context.signal_phase_code)}]"
+            ),
         ])
 
         for vehicle_snapshot, vehicle_summary in zip(object_snapshots, context.surrounding_vehicles):
             vehicle_id = str(vehicle_summary.vehicle_id)
-            vehicle_lane_context = int(
-                AStarGlobalPlanner(lane_center_waypoints).get_local_lane_context(
-                    x_m=float(vehicle_summary.x_m),
-                    y_m=float(vehicle_summary.y_m),
-                    heading_rad=float(vehicle_summary.psi_rad),
-                ).get("lane_id", -1)
-            )
-            vehicle_lane_prompt = self._prompt_lane_id(vehicle_lane_context, lane_count)
+            intention_code = self._simplify_intention_code(vehicle_summary.predicted_intention)
+            participant_type_code = self._participant_type_code(vehicle_snapshot)
 
             lines.extend(
                 [
-                    "",
                     (
-                        f"V{vehicle_id}:["
+                        f"v[{vehicle_id}] = ["
                         f"{self._format_numeric(vehicle_summary.x_m)},"
                         f"{self._format_numeric(vehicle_summary.y_m)},"
                         f"{self._format_numeric(vehicle_summary.v_mps)},"
                         f"{self._format_numeric(vehicle_summary.psi_rad, decimals=6)},"
-                        f"{vehicle_lane_prompt},"
-                        f"{vehicle_summary.predicted_intention}]"
+                        f"{intention_code},"
+                        f"{int(participant_type_code)}]"
                     ),
                 ]
             )
@@ -505,8 +530,9 @@ def build_behavior_planner_prompt(
     mpc_constraints: Mapping[str, object] | None = None,
     prompt_id: str | int | None = None,
     previous_behavior: str = "LANE_KEEP",
+    route_summary: RoutePlanSummary | None = None,
 ) -> str:
-    """Functional wrapper for the compact prompt builder."""
+    """Functional wrapper for the prompt builder."""
 
     builder = BehaviorPlannerPromptBuilder()
     return builder.build_prompt(
@@ -522,4 +548,5 @@ def build_behavior_planner_prompt(
         mpc_constraints=mpc_constraints,
         prompt_id=prompt_id,
         previous_behavior=previous_behavior,
+        route_summary=route_summary,
     )

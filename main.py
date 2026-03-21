@@ -209,6 +209,30 @@ def wait_for_carla_server(carla, host: str, port: int, timeout_s: float) -> Any:
     )
 
 
+def wait_for_carla_world_ready(client, world, timeout_s: float) -> Any:
+    """
+    Wait until the currently loaded world responds to the core API calls used
+    by the scenario runner.
+    """
+
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            current_world = client.get_world()
+            current_world.get_map()
+            current_world.get_settings()
+            current_world.get_blueprint_library()
+            return current_world
+        except Exception as exc:
+            last_error = exc
+            time.sleep(1.0)
+    raise RuntimeError(
+        "Timed out while waiting for the loaded CARLA world to become ready. "
+        f"Last error: {last_error}"
+    )
+
+
 def _build_map_load_candidates(map_name: str) -> list[str]:
     """
     Build a small set of plausible CARLA map identifiers for imported maps.
@@ -305,6 +329,12 @@ def run_carla_scenario(name: str) -> int:
             f"Available maps reported by server: {available_maps}. "
             f"Last error: {last_error}"
         )
+
+    world = wait_for_carla_world_ready(
+        client=client,
+        world=world,
+        timeout_s=max(10.0, float(request_timeout_s)),
+    )
 
     settings = world.get_settings()
     settings.synchronous_mode = bool(carla_cfg.get("synchronous_mode", False))

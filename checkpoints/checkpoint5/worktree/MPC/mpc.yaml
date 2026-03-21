@@ -1,0 +1,468 @@
+mpc:
+  # Prediction horizon [s].
+  # Increase -> planner can anticipate farther ahead, but the QP gets larger
+  # and more expensive. Decrease -> faster solve, but shorter planning view.
+  horizon_s: 3.0
+
+  # MPC discretization step [s].
+  # Increase -> fewer horizon steps and faster solve, but rougher dynamics.
+  # Decrease -> finer dynamics and smoother planning, but larger QP size.
+  # The CARLA scenario runner overrides this with CARLA fixed_delta_seconds at
+  # runtime so the planner and simulator use the same step.
+  plan_dt_s: 0.05 #0.05
+
+  # Replan frequency [Hz].
+  # Increase -> fresher plans and better reaction to moving objects, but more
+  # compute cost. Decrease -> cheaper runtime, but plans can go stale.
+  trajectory_generation_frequency_hz: 5.0 #2
+
+  # Runtime behavior-planner loop for the LLM. This loop is separate from the
+  # MPC replan loop. It builds prompts, optionally calls the API, and caches
+  # the latest valid decision for the MPC loop to apply.
+  behavior_planner_runtime:
+    # Enable/disable the background prompt thread.
+    # true  -> main.py starts the behavior-planner prompt loop.
+    # false -> no behavior-planner prompt is generated during simulation.
+    enabled: true
+
+    # Prompt-generation frequency [Hz] for the separate behavior-planner
+    # thread.
+    # Increase -> fresher prompt updates, but more console output and compute.
+    # Decrease -> quieter output and lower overhead, but slower prompt refresh.
+    frequency_hz: 1
+
+    # Enable/disable the OpenAI API call from the behavior-planner thread.
+    # true  -> build prompt, call the model, parse JSON, and apply the result.
+    # false -> only print the system instruction / prompt without API use.
+    api_enabled: true
+
+    # OpenAI model used for behavior planning.
+    model: gpt-4o
+
+    # Environment variable name that stores the OpenAI API key used by the
+    # behavior-planner thread. The client loads this from the shell
+    # environment or from a project-local `.env` file.
+    api_key_env_var: OPENAI_API_KEY
+
+    # Determinism control for the behavior-planner model.
+    # 0.0 -> most deterministic behavior available.
+    temperature: 0.0
+
+    # Per-request timeout [s] for the API call.
+    request_timeout_s: 30.0
+
+    # Maximum allowed response age [s] for one behavior-planner request.
+    # If a request has not produced a response within this time, it is ignored
+    # and the next prompt tick is allowed to send a new request.
+    response_deadline_s: 4.5
+
+    # Maximum output tokens reserved for the JSON response.
+    max_output_tokens: 80
+
+    # Extra forward clearance buffer [m] added on top of the current lookahead
+    # distance when checking whether a lane is safe for the behavior-planner
+    # prompt.
+    # Rule for an obstacle ahead on that lane:
+    #   threshold = current lookahead distance + lane_safe_forward_buffer_m
+    # Increase -> more conservative forward-lane safety flags.
+    # Decrease -> more permissive forward-lane safety flags.
+    lane_safe_forward_buffer_m: 20.0
+
+    # Rear longitudinal clearance threshold [m] used to mark a lane as safe in
+    # the behavior-planner prompt.
+    # Rule for an obstacle behind on that lane:
+    #   threshold = lane_safe_rear_longitudinal_distance_m
+    # Increase -> more conservative rear-lane safety flags.
+    # Decrease -> more permissive rear-lane safety flags.
+    lane_safe_rear_longitudinal_distance_m: 10.0
+
+    # Console logging controls for debugging the behavior planner.
+    print_system_instruction: false
+    print_prompt: true
+    print_response: true
+
+
+    
+
+  # Rolling temporary-destination settings shared by the integration layer and
+  # the MPC interface. These parameters control what destination state is fed
+  # into the optimizer before each replan.
+  local_goal:
+    # Speed reference [m/s] attached to rolling temporary destinations.
+    # Increase -> temporary goals encourage more aggressive cruising.
+    # Decrease -> temporary goals become more conservative.
+    v_ref_mps: 20.0
+
+    # Extra forward buffer [m] added on top of the current lookahead distance
+    # when the behavior planner rebuilds the temporary destination position on
+    # the selected lane.
+    # Effective target distance = lookahead distance + this buffer.
+    # Increase -> temporary destination is placed farther ahead.
+    # Decrease -> temporary destination stays closer to the ego.
+    behavior_destination_distance_buffer_m: 0.0 #10
+
+    # Enable dynamic lookahead distance for the temporary destination. When
+    # enabled, the target distance is:
+    #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
+    #   L_d   = clamp(L_raw, d_min, d_max)
+    # where:
+    #   d_min = dynamic_lookahead_min_distance_m
+    #   d_max = dynamic_lookahead_max_distance_m
+    #   k_v   = dynamic_lookahead_speed_gain
+    #   k_c   = dynamic_lookahead_curvature_gain
+    #   V     = ego speed [m/s]
+    #   kappa = local path curvature estimated from forward waypoints
+    # Increase the speed gain -> farther lookahead at higher speed.
+    # Increase the curvature gain -> shorter lookahead on curved roads.
+    dynamic_lookahead_enabled: true
+
+    # d_min in the dynamic lookahead equation above.
+    # This also acts as the hard lower bound used when the behavior planner
+    # rebuilds the temporary destination, so the temporary goal does not
+    # collapse too close to the ego at very low speed.
+    # Increase -> even at low speed the temporary goal stays farther ahead.
+    # Decrease -> more reactive, near-term temporary goals.
+    dynamic_lookahead_min_distance_m: 10.0 #30
+
+    # d_max in the dynamic lookahead equation above.
+    # Increase -> allow farther temporary goals on fast/straight segments.
+    # Decrease -> cap the temporary goal closer to the ego.
+    dynamic_lookahead_max_distance_m: 100.0 #60
+
+    # k_v in:
+    #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
+    # Increase -> lookahead grows faster with ego speed.
+    # Decrease -> speed has less effect on lookahead distance.
+    dynamic_lookahead_speed_gain: 3 #3
+
+    # k_c in:
+    #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
+    # Increase -> curvature shortens lookahead more aggressively.
+    # Decrease -> curved-road penalty becomes weaker.
+    dynamic_lookahead_curvature_gain: 1.0
+
+    # Distance [m] between the three forward samples used to estimate
+    # curvature with:
+    #   kappa = (4 * area) / (a * b * c)
+    # where a, b, c are the triangle side lengths between the three sample
+    # points ahead of the ego.
+    # Increase -> smoother, more global curvature estimate.
+    # Decrease -> more local, more sensitive curvature estimate.
+    dynamic_lookahead_curvature_sample_spacing_m: 5.0
+
+    # Lock the temporary destination to the real final destination when the
+    # temporary goal is this close [m] to the final stop/goal point.
+    # Increase -> switch to final-goal behavior earlier.
+    # Decrease -> keep rolling temporary goals active longer.
+    lock_to_final_distance_m: 30.0
+
+    # Final-goal success threshold [m] used by the rolling-goal logic.
+    # Increase -> easier to declare the final goal reached.
+    # Decrease -> tighter final-position requirement.
+    final_reached_threshold_m: 0.5
+
+  # Speed-cap logic used when the active destination is a stop goal
+  # (destination speed approximately zero). The cap is:
+  #   v_cap(d) = min(v_max, sqrt(2 * a_brake * max(d - stop_buffer, 0)))
+  # where a_brake is taken from abs(mpc.constraints.min_acceleration_mps2).
+  final_stop_speed_cap:
+    # Enable/disable the final-stop speed cap entirely.
+    enabled: true
+
+    # Activate the stop cap only when destination speed <= this threshold [m/s].
+    # Increase -> more goals count as stop goals.
+    # Decrease -> only near-zero-speed goals activate the cap.
+    destination_speed_activation_threshold_mps: 0.05
+
+    # Reserve this much distance [m] before the final stop point.
+    # Increase -> stop earlier and more conservatively.
+    # Decrease -> allow speed to stay higher closer to the stop point.
+    stop_buffer_m: 10
+
+  # Nominal rollout used only to generate the linearization point for LTV-MPC.
+  # The rollout is a heuristic guessed trajectory; it is not the optimized
+  # result. MPC linearizes around this guess and then solves the QP.
+  reference_rollout:
+    # Heading-controller gain used to turn heading error into guessed steering.
+    # Increase -> sharper guessed steering. Decrease -> more timid rollout turn.
+    heading_gain: 1.6
+
+    # Speed-controller gain used to turn speed error into guessed acceleration.
+    # Increase -> faster guessed accel/brake changes.
+    # Decrease -> smoother but slower rollout speed adaptation.
+    speed_gain: 1.2
+
+    # If true, the rollout follows a per-stage lane-center path when waypoint
+    # data is available. If false, it always points directly toward the active
+    # destination state.
+    prefer_lane_center_path: true
+
+    # Blend between path tangent and line-of-sight heading in the rollout:
+    #   0.0 -> pure path heading
+    #   1.0 -> pure point-at-target heading
+    # Increase -> more direct target pointing.
+    # Decrease -> more lane/path-tangent following.
+    path_los_heading_blend: 0.35
+
+    # Reuse the previous solved MPC trajectory as the next rollout seed when
+    # the current ego state still matches it closely.
+    use_previous_solution_seed: false
+
+    # Number of early stages searched when aligning the current ego state to the
+    # previous solved plan.
+    # Increase -> more chances to match a reused plan.
+    # Decrease -> stricter, more local reuse only.
+    previous_solution_search_steps: 15
+
+    # Maximum allowed position mismatch [m] for previous-plan reuse.
+    # Increase -> reuses old plans more often, even when stale.
+    # Decrease -> rejects stale plans more aggressively.
+    previous_solution_max_position_error_m: 3.0
+
+    # Maximum allowed heading mismatch [rad] for previous-plan reuse.
+    # Increase -> reuses old plans despite larger yaw mismatch.
+    # Decrease -> requires tighter heading agreement.
+    previous_solution_max_heading_error_rad: 0.75
+
+    # Maximum allowed speed mismatch [m/s] for previous-plan reuse.
+    # Increase -> more tolerant reuse.
+    # Decrease -> more likely to rebuild rollout from scratch.
+    previous_solution_max_speed_error_mps: 1.0
+
+    # Number of sequential linearization / solve passes per replan.
+    # Increase -> better local nonlinear consistency, but more CPU time.
+    # Decrease -> faster replans, but more dependence on the initial guess.
+    sequential_linearization_iterations: 1 #2
+
+    # Apply a simple lead-obstacle speed heuristic inside the rollout seed.
+    # This only changes the guessed speed profile; the real obstacle avoidance
+    # still comes from the MPC obstacle cost.
+    obstacle_aware_speed_enabled: true
+
+    # Prediction horizon [s] checked for lead obstacles in the rollout.
+    # Increase -> rollout reacts to farther predicted traffic.
+    # Decrease -> rollout only reacts to very near-term lead objects.
+    obstacle_check_horizon_s: 4.0
+
+    # Ignore lead obstacles beyond this along-track gap [m].
+    # Increase -> rollout slows for farther objects.
+    # Decrease -> rollout ignores farther lead objects.
+    lead_obstacle_trigger_distance_m: 22.0
+
+    # Extra lateral corridor margin [m] used to decide whether a predicted
+    # obstacle belongs to the same rollout corridor.
+    # Increase -> more obstacles count as lead obstacles.
+    # Decrease -> only more aligned obstacles are considered.
+    lead_obstacle_lateral_margin_m: 1.2
+
+    # Longitudinal buffer [m] reserved before a lead obstacle when computing the
+    # rollout speed limit.
+    # Increase -> earlier and stronger rollout braking.
+    # Decrease -> rollout can carry more speed toward the lead obstacle.
+    lead_obstacle_stop_buffer_m: 8.0
+
+    # Positive deceleration [m/s^2] used in the lead-obstacle stopping-speed
+    # heuristic.
+    # Increase -> rollout assumes stronger braking is available, so it allows
+    # higher speed for the same gap.
+    # Decrease -> rollout becomes more conservative.
+    lead_obstacle_braking_deceleration_mps2: 1.5
+
+  # MPC objective:
+  #   J = Cost_Attractive + Cost_LaneCenter + Cost_Repulsive + Cost_Control
+  cost:
+    attractive:
+      # Global weight on destination-state tracking.
+      # Increase -> stronger pull to the active destination state.
+      # Decrease -> more freedom for obstacle and lane costs to dominate.
+      w_attractive: 1.0
+
+      # State-tracking weights toward [x_ref, y_ref, v_ref, psi_ref].
+      # Increase a component -> more importance for that state channel.
+      # Decrease a component -> less importance for that channel.
+      q_x: 0 #10
+      q_y: 0
+      q_v: 5.0 #10
+      q_psi: 0.0 #0
+
+    lane_center_follow:
+      # Enable/disable the lane-center-follow cost.
+      enabled: true
+
+      # Constant lane-center weight used at every stage of the horizon.
+      # Increase -> stronger pull to the lane center and lane heading.
+      # Decrease -> weaker lane-centering behavior.
+      w0: 30.0 #30
+
+      # Additional heading-error weight inside the lane-center term:
+      #   w0 * q_psi * wrap(psi - psi_lane)^2
+      # Increase -> stronger lane-heading alignment.
+      # Decrease -> lane-center cost behaves more like pure lateral position.
+      q_psi: 10.0 #30
+
+    control:
+      # Global weight on control smoothness.
+      # Increase -> smoother accel/steer changes, but more sluggish motion.
+      # Decrease -> more aggressive control changes.
+      w_control: 30.0 #30
+
+      # Rate-change penalties:
+      #   q_a     on ((a_k-a_{k-1})/dt)^2
+      #   q_delta on ((delta_k-delta_{k-1})/dt)^2
+      # Increase -> smoother change in that actuator.
+      # Decrease -> faster actuator changes allowed.
+      q_a: 5.0 #10
+      q_delta: 30 #100
+
+    # Super-ellipsoid obstacle potential used in the live MPC objective.
+    #
+    # For each obstacle and stage:
+    #   J_obs = J_safe + J_collision
+    #   J_safe      = w_s * exp(-k_s * (r_s - s_s))
+    #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+    #
+    # where:
+    #   r_s = normalized distance to the larger safe zone
+    #   r_c = normalized distance to the tighter collision zone
+    #   w_s = w_safe_zone
+    #   w_c = w_collision_zone
+    #   k_s = safe_exponential_gain
+    #   k_c = collision_exponential_gain
+    #   s_s = safe_distance_shift
+    #   s_c = collision_distance_shift
+    #
+    # Both terms stay active for all distances. When r becomes smaller than the
+    # corresponding shift, that zone's exponential cost grows rapidly.
+    repulsive_potential:
+      enabled: true
+
+      # Safe-zone weight w_s in:
+      #   J_safe = w_s * exp(-k_s * (r_s - s_s))
+      # Increase -> larger safe-zone cost at every distance.
+      # Decrease -> smaller safe-zone cost at every distance.
+      w_safe_zone: 1.0e2
+
+      # Collision-zone weight w_c in:
+      #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+      # Increase -> larger collision-zone cost at every distance.
+      # Decrease -> smaller collision-zone cost at every distance.
+      w_collision_zone: 100.0
+
+      # Safe-zone exponential gain k_s in:
+      #   J_safe = w_s * exp(-k_s * (r_s - s_s))
+      # Increase -> safe-zone cost decays faster with distance and rises more
+      # sharply as r_s drops below s_s.
+      # Decrease -> safe-zone cost stays spread over a wider distance band.
+      safe_exponential_gain: 3.0 #3
+
+      # Safe-zone distance shift s_s in:
+      #   J_safe = w_s * exp(-k_s * (r_s - s_s))
+      # Increase -> the same safe-zone cost level is moved farther away from
+      # the obstacle (larger r_s).
+      # Decrease -> the safe-zone cost peak is pulled closer to the obstacle.
+      safe_distance_shift: 1.5
+
+      # Collision-zone exponential gain k_c in:
+      #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+      # Increase -> collision cost decays faster with distance and rises more
+      # sharply as r_c drops below s_c.
+      # Decrease -> collision cost stays influential over a wider distance band.
+      collision_exponential_gain: 10.0
+
+      # Collision-zone distance shift s_c in:
+      #   J_collision = w_c * exp(-k_c * (r_c - s_c))
+      # Increase -> the same collision cost level is moved farther away from
+      # the obstacle (larger r_c).
+      # Decrease -> the collision cost peak is pulled closer to the obstacle.
+      collision_distance_shift: 1.5
+
+      # Max braking deceleration [m/s^2] used for collision-zone inflation.
+      # Increase -> tighter collision zone.
+      # Decrease -> larger collision zone.
+      max_braking_deceleration_mps2: 10.0
+
+      # Comfort deceleration [m/s^2] used for safe-zone inflation.
+      # Increase -> smaller safe zone.
+      # Decrease -> larger, more cautious safe zone.
+      comfort_deceleration_mps2: 2.0
+
+      # Reaction time [s] added to the safe zone only.
+      # Increase -> safe zone starts earlier.
+      # Decrease -> safe zone starts later.
+      reaction_time_s: 1.0
+
+      # Static longitudinal geometry buffer [m] added after combining ego and
+      # obstacle shape along the obstacle heading axis.
+      # Increase -> larger front/rear clearance.
+      # Decrease -> tighter longitudinal fit.
+      static_longitudinal_buffer_m: 0.5
+
+      # Static lateral geometry buffer [m] added after combining ego and
+      # obstacle shape across the obstacle heading axis.
+      # Increase -> larger side clearance.
+      # Decrease -> tighter lateral fit.
+      static_lateral_buffer_m: 1
+
+      # Super-ellipsoid exponent n.
+      # 2 -> ellipse-like. Larger values -> more rectangle-like rounded box.
+      shape_exponent: 4.0
+
+      # Minimum lateral approach speed [m/s] used to avoid zero-width lateral
+      # dynamic inflation in near-parallel motion.
+      # Increase -> more lateral caution even when relative lateral motion is
+      # tiny. Decrease -> narrower lateral inflation for near-parallel traffic.
+      min_lateral_approach_speed_mps: 0.1
+
+      # Maximum full longitudinal field length [m] used to clamp the collision
+      # and safe-zone half-lengths:
+      #   x_c <- min(x_c, 0.5 * L_max)
+      #   x_s <- min(x_s, 0.5 * L_max)
+      # where L_max = max_longitudinal_zone_length_m.
+      # Increase -> allow the field to extend farther ahead/behind the obstacle.
+      # Decrease -> force a shorter longitudinal field.
+      max_longitudinal_zone_length_m: 15.0
+
+      # Clamp the lateral half-widths y_c and y_s so the full potential-field
+      # width does not exceed a fraction of the lane width:
+      #   y_c <- min(y_c, 0.5 * lane_width * f_lane)
+      #   y_s <- min(y_s, 0.5 * lane_width * f_lane)
+      # where f_lane = max_lateral_zone_lane_fraction.
+      # true  -> keep safe/collision field width within the lane width.
+      # false -> allow the field to spill across lane boundaries.
+      limit_lateral_zone_to_lane_width: true
+
+      # Lane-width fraction f_lane used in:
+      #   y_limit = 0.5 * lane_width * f_lane
+      # Increase toward 1.0 -> allow the field to use more of the lane width.
+      # Decrease -> force a narrower lateral field inside the lane.
+      max_lateral_zone_lane_fraction: 1
+
+      # Project the local obstacle-cost Hessian to positive semidefinite form so
+      # OSQP sees a convex quadratic approximation.
+      project_hessian_psd: true
+
+      # Minimum eigenvalue kept during PSD projection.
+      # Increase -> more numerical stability, but more curvature smoothing.
+      # Decrease -> closer to the raw local Hessian, but less robust.
+      min_hessian_eig: 1.0e-9
+
+  solver:
+    # Maximum OSQP iterations.
+    # Increase -> solver gets more chances to converge.
+    # Decrease -> faster failure on hard QPs.
+    max_iter: 10000
+
+    # Absolute feasibility/optimality tolerance.
+    # Increase -> faster but less precise solve.
+    # Decrease -> more accurate but potentially slower solve.
+    eps_abs: 1.0e-3
+
+    # Relative feasibility/optimality tolerance.
+    # Increase -> looser stopping condition.
+    # Decrease -> tighter solve accuracy target.
+    eps_rel: 1.0e-3
+
+    # Run OSQP polish after the main ADMM solve.
+    # true -> can improve final solution accuracy at some extra cost.
+    # false -> faster solve, but slightly rougher final result.
+    polish: true

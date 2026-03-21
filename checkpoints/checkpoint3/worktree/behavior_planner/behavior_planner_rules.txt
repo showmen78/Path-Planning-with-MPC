@@ -1,0 +1,40 @@
+
+After receiving the response from the behavior planner, the following changes will be made based on the selected behavior.
+
+if behavior == LANE_KEEP or behavior == GO_STRAIGHT:
+    no change needed, run everything as is running.
+    V_ref = V_ref (max velocity)
+
+elif behavior == LANE_CHANGE_LEFT:
+    temporary_destination = waypoint at look ahead distance away in the left lane
+    repeated LANE_CHANGE_LEFT responses continue the same left-lane-change target;
+    they do not request another extra left lane change until another behavior is applied
+    V_ref = V_ref (max velocity)
+
+elif behavior == LANE_CHANGE_RIGHT:
+    temporary_destination = waypoint at look ahead distance away in the right lane
+    repeated LANE_CHANGE_RIGHT responses continue the same right-lane-change target;
+    they do not request another extra right lane change until another behavior is applied
+    V_ref = V_ref (max velocity)
+
+elif behavior == STOP_AT_LINE:
+    fix the temporary_destination at distance to traffic signal or distance to intersection, whichever is smaller, and set V_ref = 0
+
+elif behavior == EMERGENCY_BRAKE:
+    temporary_destination = waypoint at stopping distance (using the abs(max deceleration))
+    V_ref = 0
+    store current V_max in another variable
+    set V_max = 0
+
+If a later decision is made and the selected behavior is not EMERGENCY_BRAKE,
+restore V_max from the stored value
+and if V_ref is still 0 from the previous emergency-brake state, set
+V_ref = V_max, unless the current temporary_destination has already reached the
+final destination.
+
+elif behavior == TURN_LEFT or behavior == TURN_RIGHT:
+    temporary_destination = waypoint look ahead distance away on the left/right road.
+    V_ref = target_velocity
+
+If the current temporary_destination has already reached the final destination,
+keep the destination fixed there and set V_ref = 0.

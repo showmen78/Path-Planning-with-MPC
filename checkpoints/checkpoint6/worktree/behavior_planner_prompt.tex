@@ -1,0 +1,209 @@
+\documentclass[aspectratio=169]{beamer}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{listings}
+
+\usetheme{Madrid}
+\setbeamertemplate{navigation symbols}{}
+
+\definecolor{codebg}{RGB}{245,247,250}
+\definecolor{codeborder}{RGB}{220,224,230}
+
+\lstdefinestyle{codestyle}{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codeborder},
+    breaklines=true,
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
+}
+
+\title{Behavior Planner Prompt}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}[fragile]{Interface Summary}
+\textbf{Purpose:} high-level behavior planner for the ego vehicle
+
+\vspace{0.4em}
+\textbf{Current input lines}
+\begin{lstlisting}[style=codestyle]
+ID: number
+ego = [x, y, v, psi, lane_id, maneuver_possible]
+lane = [left_safe, current_safe, right_safe]
+route = [next_maneuver, dist_to_signal, signal_phase]
+v[id] = [x, y, v, psi, intention, type]
+\end{lstlisting}
+
+\textbf{Current output}
+\begin{lstlisting}[style=codestyle]
+{
+  "id": number,
+  "behavior": "..."
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Input Format}
+\begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+        \textbf{Prompt structure}
+        \begin{lstlisting}[style=codestyle]
+ID: 12
+ego = [x, y, v, psi, lane_id, mp]
+lane = [l_safe, c_safe, r_safe]
+route = [man, dist_sig, sig]
+v[id] = [x, y, v, psi, int, type]
+        \end{lstlisting}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+        \textbf{Field types}
+        \begin{tabular}{>{\ttfamily}p{0.28\textwidth}p{0.60\textwidth}}
+            \toprule
+            Field & Type \\
+            \midrule
+            ID & integer \\
+            x, y & float \\
+            v & float (m/s) \\
+            psi & float (rad) \\
+            lane\_id & integer \\
+            mp & binary \\
+            l/c/r\_safe & binary \\
+            man & categorical \\
+            dist\_sig & float \\
+            sig & categorical \\
+            int & categorical \\
+            type & categorical \\
+            \bottomrule
+        \end{tabular}
+    \end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}[fragile]{Ego and Lane Fields}
+\begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+        \textbf{ego line}
+        \begin{lstlisting}[style=codestyle]
+ego = [x, y, v, psi, lane_id, maneuver_possible]
+        \end{lstlisting}
+
+        \begin{itemize}
+            \item \texttt{x, y, v, psi}: ego state
+            \item \texttt{lane\_id}: compact prompt lane index
+            \item \texttt{maneuver\_possible}: can current lane execute next required turn
+        \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+        \textbf{lane line}
+        \begin{lstlisting}[style=codestyle]
+lane = [left_safe, current_safe, right_safe]
+        \end{lstlisting}
+
+        \textbf{Available values}
+        \begin{itemize}
+            \item \texttt{1}: safe
+            \item \texttt{0}: unsafe
+        \end{itemize}
+
+        \textbf{Lane-ID convention}
+        \begin{itemize}
+            \item \texttt{0}: left road edge reference
+            \item \texttt{-1}: left-most lane
+            \item \texttt{-2}: next lane to the right
+        \end{itemize}
+    \end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}[fragile]{Route and Vehicle Fields}
+\begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+        \textbf{route line}
+        \begin{lstlisting}[style=codestyle]
+route = [next_maneuver, dist_to_signal, signal_phase]
+        \end{lstlisting}
+
+        \textbf{Options}
+        \begin{itemize}
+            \item \texttt{next\_maneuver}: \texttt{S}, \texttt{L}, \texttt{R}
+            \item \texttt{signal\_phase}: \texttt{R}, \texttt{Y}, \texttt{G}
+        \end{itemize}
+
+        \textbf{Note}
+        \begin{itemize}
+            \item Route is computed from temporary destination to final destination
+        \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+        \textbf{surrounding vehicle line}
+        \begin{lstlisting}[style=codestyle]
+v[id] = [x, y, v, psi, intention, type]
+        \end{lstlisting}
+
+        \textbf{Options}
+        \begin{itemize}
+            \item \texttt{intention}: \texttt{K}, \texttt{L}, \texttt{R}, \texttt{S}, \texttt{B}, \texttt{A}
+            \item \texttt{type}: \texttt{0} regular, \texttt{1} emergency, \texttt{2} VRU
+        \end{itemize}
+    \end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}[fragile]{Output Format}
+\begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+        \textbf{Strict JSON response}
+        \begin{lstlisting}[style=codestyle]
+{
+  "id": 12,
+  "behavior": "LANE_KEEP"
+}
+        \end{lstlisting}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+        \textbf{Allowed behavior options}
+        \begin{itemize}
+            \item \texttt{LANE\_KEEP}
+            \item \texttt{LANE\_CHANGE\_LEFT}
+            \item \texttt{LANE\_CHANGE\_RIGHT}
+            \item \texttt{STOP}
+            \item \texttt{EMERGENCY\_BRAKE}
+        \end{itemize}
+
+        \textbf{Constraint}
+        \begin{itemize}
+            \item Return JSON only
+            \item \texttt{id} must match prompt id
+        \end{itemize}
+    \end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Current Runtime Notes}
+\begin{itemize}
+    \item No previous-behavior line is sent in the live prompt
+    \item No target speed is requested from the model
+    \item \texttt{maneuver\_possible} is enforced mainly for left/right turns
+    \item Current prompt builder still emits placeholder signal values:
+    \begin{itemize}
+        \item \texttt{dist\_to\_signal = 1000}
+        \item \texttt{signal\_phase = G}
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+\end{document}

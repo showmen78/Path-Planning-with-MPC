@@ -9,12 +9,12 @@ mpc:
   # Decrease -> finer dynamics and smoother planning, but larger QP size.
   # The CARLA scenario runner overrides this with CARLA fixed_delta_seconds at
   # runtime so the planner and simulator use the same step.
-  plan_dt_s: 0.1 #0.05
+  plan_dt_s: 0.05 #0.05
 
   # Replan frequency [Hz].
   # Increase -> fresher plans and better reaction to moving objects, but more
   # compute cost. Decrease -> cheaper runtime, but plans can go stale.
-  trajectory_generation_frequency_hz: 2.0 #2
+  trajectory_generation_frequency_hz: 5.0 #2
 
   # Runtime behavior-planner loop for the LLM. This loop is separate from the
   # MPC replan loop. It builds prompts, optionally calls the API, and caches
@@ -59,11 +59,10 @@ mpc:
     # Maximum output tokens reserved for the JSON response.
     max_output_tokens: 80
 
-    # Extra forward clearance buffer [m] added on top of the current lookahead
-    # distance when checking whether a lane is safe for the behavior-planner
-    # prompt.
+    # Forward longitudinal clearance threshold [m] used to mark a lane as safe
+    # in the behavior-planner prompt.
     # Rule for an obstacle ahead on that lane:
-    #   threshold = current lookahead distance + lane_safe_forward_buffer_m
+    #   threshold = lane_safe_forward_buffer_m
     # Increase -> more conservative forward-lane safety flags.
     # Decrease -> more permissive forward-lane safety flags.
     lane_safe_forward_buffer_m: 20.0
@@ -74,12 +73,12 @@ mpc:
     #   threshold = lane_safe_rear_longitudinal_distance_m
     # Increase -> more conservative rear-lane safety flags.
     # Decrease -> more permissive rear-lane safety flags.
-    lane_safe_rear_longitudinal_distance_m: 10.0
+    lane_safe_rear_longitudinal_distance_m: 5.0
 
     # Console logging controls for debugging the behavior planner.
     print_system_instruction: false
-    print_prompt: true
-    print_response: true
+    print_prompt: false
+    print_response: false
 
 
     
@@ -133,13 +132,13 @@ mpc:
     #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
     # Increase -> lookahead grows faster with ego speed.
     # Decrease -> speed has less effect on lookahead distance.
-    dynamic_lookahead_speed_gain: 3 #3
+    dynamic_lookahead_speed_gain: 1 #3
 
     # k_c in:
     #   L_raw = d_min + (k_v * V) - (k_c * |kappa|)
     # Increase -> curvature shortens lookahead more aggressively.
     # Decrease -> curved-road penalty becomes weaker.
-    dynamic_lookahead_curvature_gain: 1.0
+    dynamic_lookahead_curvature_gain: 6.0 #1
 
     # Distance [m] between the three forward samples used to estimate
     # curvature with:
@@ -280,31 +279,25 @@ mpc:
       # State-tracking weights toward [x_ref, y_ref, v_ref, psi_ref].
       # Increase a component -> more importance for that state channel.
       # Decrease a component -> less importance for that channel.
-      q_x: 0 #10
-      q_y: 0
-      q_v: 20.0 #10
-      q_psi: 0.0
+      q_x: 0.2 #10
+      q_y: 0 #0
+      q_v: 5.0 #10
+      q_psi: 0.0 #0
 
     lane_center_follow:
       # Enable/disable the lane-center-follow cost.
       enabled: true
 
-      # Base lane-center weight at the first stage in:
-      #   w_k = w0 * alpha^(k-1)
+      # Constant lane-center weight used at every stage of the horizon.
       # Increase -> stronger pull to the lane center and lane heading.
       # Decrease -> weaker lane-centering behavior.
-      w0: 30.0
+      w0: 5.0 #30
 
       # Additional heading-error weight inside the lane-center term:
-      #   w_k * q_psi * wrap(psi - psi_lane)^2
+      #   w0 * q_psi * wrap(psi - psi_lane)^2
       # Increase -> stronger lane-heading alignment.
       # Decrease -> lane-center cost behaves more like pure lateral position.
-      q_psi: 10.0
-
-      # Stage decay factor for lane-center weight.
-      # Increase toward 1.0 -> far-horizon lane error matters more.
-      # Decrease -> near-horizon lane error dominates.
-      alpha: 0.97
+      q_psi: 2.0 #10
 
     control:
       # Global weight on control smoothness.
@@ -318,7 +311,7 @@ mpc:
       # Increase -> smoother change in that actuator.
       # Decrease -> faster actuator changes allowed.
       q_a: 5.0 #10
-      q_delta: 50 #10
+      q_delta: 30 #100
 
     # Super-ellipsoid obstacle potential used in the live MPC objective.
     #

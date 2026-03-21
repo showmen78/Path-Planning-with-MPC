@@ -1,223 +1,138 @@
-\documentclass[11pt]{article}
+\documentclass[aspectratio=169]{beamer}
 
-\usepackage[margin=1in]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
-\usepackage{xcolor}
-\usepackage{enumitem}
-\usepackage{listings}
-\usepackage{setspace}
-\usepackage{hyperref}
+\usepackage{amsmath}
 
-\hypersetup{
-    colorlinks=true,
-    linkcolor=black,
-    urlcolor=blue
-}
+\usetheme{Madrid}
+\setbeamertemplate{navigation symbols}{}
 
-\definecolor{codebg}{RGB}{245,247,250}
-\definecolor{codeborder}{RGB}{220,224,230}
-
-\lstdefinestyle{codestyle}{
-    basicstyle=\ttfamily\small,
-    backgroundcolor=\color{codebg},
-    frame=single,
-    rulecolor=\color{codeborder},
-    breaklines=true,
-    columns=fullflexible,
-    keepspaces=true,
-    showstringspaces=false,
-    xleftmargin=8pt,
-    xrightmargin=8pt,
-    aboveskip=8pt,
-    belowskip=8pt
-}
-
-\setstretch{1.08}
-\setlist[itemize]{leftmargin=1.4em}
-\setlist[enumerate]{leftmargin=1.6em}
-
-\title{Behavior Planner System Instruction and Runtime Prompt}
+\title{Lane Safety Evaluation using TTC}
+\subtitle{Behavior Planning for Autonomous Driving}
 \author{}
 \date{}
 
 \begin{document}
 
-\maketitle
+\begin{frame}
+    \titlepage
+\end{frame}
 
-\section{Purpose}
-
-This document records the \emph{current} compact LLM behavior-planner interface
-used by the CARLA branch. The system instruction is sent once at startup. After
-that, each planner query uses the compact prompt input shown below.
-
-\section{System Instruction Summary}
-
-\subsection{Role}
-
-The model is the high-level behavior planner for the ego vehicle. It must read
-the compact environment state and choose one of the allowed behaviors:
-
-\begin{lstlisting}[style=codestyle]
-LANE_KEEP
-LANE_CHANGE_LEFT
-LANE_CHANGE_RIGHT
-EMERGENCY_BRAKE
-\end{lstlisting}
-
-\subsection{Lane-ID Convention}
-
+\begin{frame}{Concept}
 \begin{itemize}
-    \item The prompt uses a compact lane convention relative to the left edge
-    of the road.
-    \item Lane $-1$ is the left-most driving lane.
-    \item Lane $-2$ is the next lane to the right.
-    \item Lane IDs decrease as the lane moves rightward.
+    \item For each lane, evaluate safety using:
+    \begin{itemize}
+        \item front obstacle
+        \item rear obstacle
+    \end{itemize}
+    \item Compute:
+    \begin{itemize}
+        \item relative distance
+        \item relative velocity
+        \item Time-to-Collision (TTC)
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Variable Definition}
+Let:
+\[
+d_{\mathrm{rel}} = \text{relative longitudinal distance}
+\qquad
+v_{\mathrm{rel}} = \text{relative closing speed}
+\]
+
+\vspace{0.4em}
+For front vehicle:
+\[
+d_{\mathrm{front}} = x_{\mathrm{obj}} - x_{\mathrm{ego}}
+\qquad
+v_{\mathrm{close,front}} = v_{\mathrm{ego}} - v_{\mathrm{obj}}
+\]
+
+For rear vehicle:
+\[
+d_{\mathrm{rear}} = x_{\mathrm{ego}} - x_{\mathrm{obj}}
+\qquad
+v_{\mathrm{close,rear}} = v_{\mathrm{obj}} - v_{\mathrm{ego}}
+\]
+\end{frame}
+
+\begin{frame}{TTC Formula}
+For closing condition:
+\[
+v_{\mathrm{close}} > 0
+\]
+
+\[
+\mathrm{TTC} = \frac{d_{\mathrm{rel}}}{v_{\mathrm{close}}}
+\]
+
+Else:
+\[
+\mathrm{TTC} = \infty
+\]
+\end{frame}
+
+\begin{frame}{Temporal Sampling}
+\begin{itemize}
+    \item Maintain last \(N\) TTC samples
+    \item Typical choice: \(N = 5\text{--}6\)
+    \item Fit a line to the TTC samples
 \end{itemize}
 
-\subsection{Prompt Fields}
+\[
+\mathrm{TTC}_{\mathrm{history}}
+=
+[\mathrm{TTC}_{k-N+1}, \ldots, \mathrm{TTC}_k]
+\]
 
-The current system instruction defines the following input blocks:
+\vspace{0.4em}
+Line fit:
+\[
+\mathrm{TTC}(i) \approx m i + b
+\]
 
-\begin{enumerate}
-    \item \texttt{ID:[prompt\_id]}
-    \item \texttt{Ego01:[x,y,v,psi,Llane]}
-    \item \texttt{ROUTE:[lane\_safe\_l,lane\_safe\_c,lane\_safe\_r]}
-    \item \texttt{PREV:[behavior]}
-    \item Zero or more surrounding-vehicle lines:
-    \texttt{V[id]:[x,y,v,psi,Llane,I]}
-\end{enumerate}
+Slope used for trend analysis:
+\[
+\mathrm{slope} = m
+\]
+\end{frame}
 
-\subsection{Route Safety Meaning}
+\begin{frame}{Decision Rule}
+For each lane:
 
-The current route block is
+\[
+\text{if }
+\bigl(\mathrm{slope} < 0\bigr)
+\;\land\;
+\bigl(\mathrm{TTC} < \mathrm{TTC}_{\mathrm{threshold}}\bigr)
+\Rightarrow
+\text{lane = NOT SAFE}
+\]
 
-\begin{lstlisting}[style=codestyle]
-ROUTE:[lane_safe_l, lane_safe_c, lane_safe_r]
-\end{lstlisting}
-
-with binary values:
-
-\begin{itemize}
-    \item \texttt{0}: not safe
-    \item \texttt{1}: safe
-\end{itemize}
-
-The instruction defines safety as follows:
-
-\begin{itemize}
-    \item If a vehicle is \textbf{ahead} in that lane, its longitudinal gap
-    must be greater than
-    \[
-    \text{lookahead distance} + \text{forward safety buffer}.
-    \]
-    \item If a vehicle is \textbf{behind} in that lane, its longitudinal gap
-    must be greater than the configured rear safety distance.
-\end{itemize}
-
-\subsection{Decision Policy}
-
-The current instruction gives the model the following decision order:
-
-\begin{enumerate}
-    \item Use \texttt{EMERGENCY\_BRAKE} only for a sudden close hazard.
-    \item If \texttt{lane\_safe\_c = 1}, choose \texttt{LANE\_KEEP}.
-    \item Consider a lane change only if \texttt{lane\_safe\_c = 0}.
-    \item If the previous decision was a lane change and the current lane is
-    still unsafe, prefer continuing the same lane change.
-    \item Repeated \texttt{LANE\_CHANGE\_LEFT} or
-    \texttt{LANE\_CHANGE\_RIGHT} responses mean continue the same maneuver,
-    not request another extra lane change.
-\end{enumerate}
-
-\subsection{Required Output}
-
-The model must return only:
-
-\begin{lstlisting}[style=codestyle]
-{
-  "id": "PROMPT_ID",
-  "behavior": "BEHAVIOR_NAME"
-}
-\end{lstlisting}
-
-\section{Current Prompt Input Format}
-
-\subsection{Template}
-
-\begin{lstlisting}[style=codestyle]
-ID:[prompt_id]
-
-Ego01:[x,y,v,psi,Llane]
-
-ROUTE:[lane_safe_l,lane_safe_c,lane_safe_r]
-
-PREV:[behavior]
-
-V[id_1]:[x,y,v,psi,Llane,I]
-V[id_2]:[x,y,v,psi,Llane,I]
-...
-\end{lstlisting}
-
-\subsection{Field Definitions}
+\[
+\text{else if }
+\bigl(\mathrm{slope} > 0\bigr)
+\Rightarrow
+\text{lane = SAFE}
+\]
 
 \begin{itemize}
-    \item \texttt{x, y}: vehicle position in world coordinates
-    \item \texttt{v}: longitudinal speed in m/s
-    \item \texttt{psi}: heading angle in radians
-    \item \texttt{Llane}: compact prompt lane ID
-    \item \texttt{I}: predicted intention code
+    \item Apply rule to both front and rear obstacle checks
+    \item Lane is selected only if safety condition is satisfied
 \end{itemize}
+\end{frame}
 
-The live surrounding-vehicle intention codes are:
-
-\begin{lstlisting}[style=codestyle]
-S  = stationary
-KC = lane keeping + constant speed
-KA = lane keeping + accelerating
-KB = lane keeping + braking
-LC = lane change left + constant speed
-LA = lane change left + accelerating
-LB = lane change left + braking
-RC = lane change right + constant speed
-RA = lane change right + accelerating
-RB = lane change right + braking
-\end{lstlisting}
-
-\section{Worked Prompt Example}
-
-\begin{lstlisting}[style=codestyle]
-ID:[12]
-
-Ego01:[8.65,-3.185,6.548,0.183481,-3]
-
-ROUTE:[1,1,0]
-
-PREV:[LANE_KEEP]
-
-Vobs_static_workzone:[18.4,-7.4,0,-0.0881,-4,S]
-Vcav_waypoint_follow2:[-12.035,-0.476,4,-0.102896,-3,KC]
-\end{lstlisting}
-
-In this example:
-
+\begin{frame}{Summary}
 \begin{itemize}
-    \item the left adjacent lane is safe,
-    \item the current lane is safe,
-    \item the right adjacent lane is not safe,
-    \item and the previous decision was \texttt{LANE\_KEEP}.
+    \item TTC captures collision risk
+    \item Trend (slope) captures risk evolution
+    \item Negative slope $\rightarrow$ increasing risk
+    \item Positive slope $\rightarrow$ decreasing risk
+    \item Used for lane selection in behavior planner
 \end{itemize}
-
-\section{Current Runtime Notes}
-
-\begin{itemize}
-    \item The system instruction is loaded from
-    \texttt{behavior\_planner/system\_instruction.txt}.
-    \item The compact prompt is generated by
-    \texttt{behavior\_planner/prompt\_builder.py}.
-    \item The response parser expects the returned \texttt{id} to match the
-    latest prompt id before accepting the decision.
-\end{itemize}
+\end{frame}
 
 \end{document}

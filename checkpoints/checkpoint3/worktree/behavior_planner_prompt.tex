@@ -1,0 +1,223 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{setspace}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue
+}
+
+\definecolor{codebg}{RGB}{245,247,250}
+\definecolor{codeborder}{RGB}{220,224,230}
+
+\lstdefinestyle{codestyle}{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codeborder},
+    breaklines=true,
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false,
+    xleftmargin=8pt,
+    xrightmargin=8pt,
+    aboveskip=8pt,
+    belowskip=8pt
+}
+
+\setstretch{1.08}
+\setlist[itemize]{leftmargin=1.4em}
+\setlist[enumerate]{leftmargin=1.6em}
+
+\title{Behavior Planner System Instruction and Runtime Prompt}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Purpose}
+
+This document records the \emph{current} compact LLM behavior-planner interface
+used by the CARLA branch. The system instruction is sent once at startup. After
+that, each planner query uses the compact prompt input shown below.
+
+\section{System Instruction Summary}
+
+\subsection{Role}
+
+The model is the high-level behavior planner for the ego vehicle. It must read
+the compact environment state and choose one of the allowed behaviors:
+
+\begin{lstlisting}[style=codestyle]
+LANE_KEEP
+LANE_CHANGE_LEFT
+LANE_CHANGE_RIGHT
+EMERGENCY_BRAKE
+\end{lstlisting}
+
+\subsection{Lane-ID Convention}
+
+\begin{itemize}
+    \item The prompt uses a compact lane convention relative to the left edge
+    of the road.
+    \item Lane $-1$ is the left-most driving lane.
+    \item Lane $-2$ is the next lane to the right.
+    \item Lane IDs decrease as the lane moves rightward.
+\end{itemize}
+
+\subsection{Prompt Fields}
+
+The current system instruction defines the following input blocks:
+
+\begin{enumerate}
+    \item \texttt{ID:[prompt\_id]}
+    \item \texttt{Ego01:[x,y,v,psi,Llane]}
+    \item \texttt{ROUTE:[lane\_safe\_l,lane\_safe\_c,lane\_safe\_r]}
+    \item \texttt{PREV:[behavior]}
+    \item Zero or more surrounding-vehicle lines:
+    \texttt{V[id]:[x,y,v,psi,Llane,I]}
+\end{enumerate}
+
+\subsection{Route Safety Meaning}
+
+The current route block is
+
+\begin{lstlisting}[style=codestyle]
+ROUTE:[lane_safe_l, lane_safe_c, lane_safe_r]
+\end{lstlisting}
+
+with binary values:
+
+\begin{itemize}
+    \item \texttt{0}: not safe
+    \item \texttt{1}: safe
+\end{itemize}
+
+The instruction defines safety as follows:
+
+\begin{itemize}
+    \item If a vehicle is \textbf{ahead} in that lane, its longitudinal gap
+    must be greater than
+    \[
+    \text{lookahead distance} + \text{forward safety buffer}.
+    \]
+    \item If a vehicle is \textbf{behind} in that lane, its longitudinal gap
+    must be greater than the configured rear safety distance.
+\end{itemize}
+
+\subsection{Decision Policy}
+
+The current instruction gives the model the following decision order:
+
+\begin{enumerate}
+    \item Use \texttt{EMERGENCY\_BRAKE} only for a sudden close hazard.
+    \item If \texttt{lane\_safe\_c = 1}, choose \texttt{LANE\_KEEP}.
+    \item Consider a lane change only if \texttt{lane\_safe\_c = 0}.
+    \item If the previous decision was a lane change and the current lane is
+    still unsafe, prefer continuing the same lane change.
+    \item Repeated \texttt{LANE\_CHANGE\_LEFT} or
+    \texttt{LANE\_CHANGE\_RIGHT} responses mean continue the same maneuver,
+    not request another extra lane change.
+\end{enumerate}
+
+\subsection{Required Output}
+
+The model must return only:
+
+\begin{lstlisting}[style=codestyle]
+{
+  "id": "PROMPT_ID",
+  "behavior": "BEHAVIOR_NAME"
+}
+\end{lstlisting}
+
+\section{Current Prompt Input Format}
+
+\subsection{Template}
+
+\begin{lstlisting}[style=codestyle]
+ID:[prompt_id]
+
+Ego01:[x,y,v,psi,Llane]
+
+ROUTE:[lane_safe_l,lane_safe_c,lane_safe_r]
+
+PREV:[behavior]
+
+V[id_1]:[x,y,v,psi,Llane,I]
+V[id_2]:[x,y,v,psi,Llane,I]
+...
+\end{lstlisting}
+
+\subsection{Field Definitions}
+
+\begin{itemize}
+    \item \texttt{x, y}: vehicle position in world coordinates
+    \item \texttt{v}: longitudinal speed in m/s
+    \item \texttt{psi}: heading angle in radians
+    \item \texttt{Llane}: compact prompt lane ID
+    \item \texttt{I}: predicted intention code
+\end{itemize}
+
+The live surrounding-vehicle intention codes are:
+
+\begin{lstlisting}[style=codestyle]
+S  = stationary
+KC = lane keeping + constant speed
+KA = lane keeping + accelerating
+KB = lane keeping + braking
+LC = lane change left + constant speed
+LA = lane change left + accelerating
+LB = lane change left + braking
+RC = lane change right + constant speed
+RA = lane change right + accelerating
+RB = lane change right + braking
+\end{lstlisting}
+
+\section{Worked Prompt Example}
+
+\begin{lstlisting}[style=codestyle]
+ID:[12]
+
+Ego01:[8.65,-3.185,6.548,0.183481,-3]
+
+ROUTE:[1,1,0]
+
+PREV:[LANE_KEEP]
+
+Vobs_static_workzone:[18.4,-7.4,0,-0.0881,-4,S]
+Vcav_waypoint_follow2:[-12.035,-0.476,4,-0.102896,-3,KC]
+\end{lstlisting}
+
+In this example:
+
+\begin{itemize}
+    \item the left adjacent lane is safe,
+    \item the current lane is safe,
+    \item the right adjacent lane is not safe,
+    \item and the previous decision was \texttt{LANE\_KEEP}.
+\end{itemize}
+
+\section{Current Runtime Notes}
+
+\begin{itemize}
+    \item The system instruction is loaded from
+    \texttt{behavior\_planner/system\_instruction.txt}.
+    \item The compact prompt is generated by
+    \texttt{behavior\_planner/prompt\_builder.py}.
+    \item The response parser expects the returned \texttt{id} to match the
+    latest prompt id before accepting the decision.
+\end{itemize}
+
+\end{document}
