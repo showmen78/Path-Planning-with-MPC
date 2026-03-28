@@ -1,5 +1,22 @@
 """Behavior-planner package exports."""
 
+# -- Rule-based planner (new) ----------------------------------------- #
+from .lane_safety import LaneSafetyScorer, LaneSafetyThread
+from .planner import (
+    evaluate_intersection_obstacle_response,
+    RuleBasedBehaviorPlanner,
+    intersection_route_follow_maneuver,
+    normalize_behavior_decision,
+    normalize_macro_maneuver,
+)
+from .temp_destination import (
+    build_reference_samples,
+    compute_ego_lane_offset,
+    compute_temp_destination_mode,
+    compute_temp_destination,
+)
+
+# -- Legacy LLM-based planner (kept for reference / fallback) ---------- #
 from .api_client import BehaviorPlannerAPIClient
 from .decision_logic import (
     BehaviorExecutionResult,
@@ -17,6 +34,19 @@ from .intention import (
 from .prompt_builder import BehaviorPlannerPromptBuilder, build_behavior_planner_prompt
 
 __all__ = [
+    # Rule-based planner
+    "LaneSafetyScorer",
+    "LaneSafetyThread",
+    "evaluate_intersection_obstacle_response",
+    "RuleBasedBehaviorPlanner",
+    "intersection_route_follow_maneuver",
+    "normalize_behavior_decision",
+    "normalize_macro_maneuver",
+    "build_reference_samples",
+    "compute_ego_lane_offset",
+    "compute_temp_destination_mode",
+    "compute_temp_destination",
+    # Legacy
     "BehaviorPlannerAPIClient",
     "BehaviorExecutionResult",
     "BehaviorPlannerDecision",

@@ -5,6 +5,7 @@ Shared CARLA scenario runner.
 from __future__ import annotations
 
 import importlib
+import inspect
 import math
 import os
 import queue
@@ -16,16 +17,19 @@ import numpy as np
 
 from MPC import (
     MPC,
-    build_lane_center_reference_to_destination,
     compute_lane_lookahead_distance,
-    compute_temporary_destination_state,
 )
 from behavior_planner import (
-    BehaviorPlannerAPIClient,
-    BehaviorPlannerDecision,
-    BehaviorPlannerPromptBuilder,
-    apply_behavior_planner_decision,
-    parse_behavior_planner_response,
+    LaneSafetyScorer,
+    RuleBasedBehaviorPlanner,
+    build_reference_samples,
+    evaluate_intersection_obstacle_response,
+    intersection_route_follow_maneuver,
+    normalize_behavior_decision,
+    normalize_macro_maneuver,
+    compute_temp_destination,
+    compute_temp_destination_mode,
+    compute_ego_lane_offset,
 )
 from utility import AStarGlobalPlanner, Tracker, build_lane_center_waypoints, load_yaml_file
 
@@ -38,6 +42,12 @@ except ImportError:  # pragma: no cover
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MPC_CONFIG_PATH = os.path.join(PROJECT_ROOT, "MPC", "mpc.yaml")
 TRACKER_CONFIG_PATH = os.path.join(PROJECT_ROOT, "utility", "tracker.yaml")
+
+# CARLA simulation tick [s]. Fixed at 20 Hz — do NOT change at runtime.
+# MPC prediction step (plan_dt_s) is independent and configured in mpc.yaml.
+CARLA_FIXED_DELTA_SECONDS: float = 0.05
+WORLD_DEBUG_ROUTE_REFRESH_PERIOD_S: float = 0.10
+WORLD_DEBUG_ROUTE_LIFE_TIME_S: float = 0.15
 REQUIRED_CONSTRAINT_KEYS = (
     "min_velocity_mps",
     "max_velocity_mps",
@@ -120,12 +130,10 @@ def _get_location_from_anchor(world, carla, name: str):
     """Check EnvironmentObjects first, then Actors, and return a CARLA location."""
     env_obj = _find_environment_object_by_name(world, carla, name)
     if env_obj is not None:
-        print(f"Matched '{name}' to EnvironmentObject: {env_obj.name}")
         return env_obj.transform.location
 
     actor = _find_actor_by_name(world, name)
     if actor is not None:
-        print(f"Matched '{name}' to Actor: {actor.type_id}")
         return actor.get_location()
 
     print(f"[CARLA GLOBAL ROUTE OUTPUT] Anchor '{name}' was not found in the loaded world.")
@@ -178,9 +186,6 @@ def _allowed_lane_ids_from_context(
     local_context: Mapping[str, object] | None,
     fallback_lane_count: int,
 ) -> list[int]:
-    if int(fallback_lane_count) > 0:
-        return list(range(1, max(1, int(fallback_lane_count)) + 1))
-
     local_context = dict(local_context or {})
     lane_ids = sorted(
         {
@@ -191,7 +196,19 @@ def _allowed_lane_ids_from_context(
     )
     if len(lane_ids) > 0:
         return lane_ids
+
+    if int(fallback_lane_count) > 0:
+        return list(range(1, max(1, int(fallback_lane_count)) + 1))
     return list(range(1, max(1, int(fallback_lane_count)) + 1))
+
+
+def _clamp_optional_lane_id_to_allowed(
+    raw_lane_id: int | None,
+    allowed_lane_ids: Sequence[int],
+) -> int:
+    if raw_lane_id is None or int(raw_lane_id) <= 0:
+        return -1
+    return _clamp_lane_id_to_allowed(int(raw_lane_id), allowed_lane_ids)
 
 
 def _clamp_lane_id_to_allowed(raw_lane_id: int | None, allowed_lane_ids: Sequence[int]) -> int:
@@ -206,6 +223,26 @@ def _clamp_lane_id_to_allowed(raw_lane_id: int | None, allowed_lane_ids: Sequenc
             key=lambda candidate_lane_id: abs(int(candidate_lane_id) - int(lane_id)),
         )
     )
+
+
+def _behavior_runtime_value(
+    behavior_runtime_cfg: Mapping[str, object] | None,
+    legacy_rule_based_cfg: Mapping[str, object] | None,
+    *,
+    key: str,
+    legacy_key: str | None = None,
+    default: object,
+) -> object:
+    runtime_cfg = dict(behavior_runtime_cfg or {})
+    legacy_cfg = dict(legacy_rule_based_cfg or {})
+
+    if key in runtime_cfg:
+        return runtime_cfg[key]
+    if legacy_key is not None and legacy_key in legacy_cfg:
+        return legacy_cfg[legacy_key]
+    if key in legacy_cfg:
+        return legacy_cfg[key]
+    return default
 
 
 def _world_state_from_vehicle(vehicle) -> List[float]:
@@ -389,38 +426,53 @@ def _draw_dotted_polyline(surface, points_px: Sequence[tuple[int, int]], color_r
             pygame.draw.circle(surface, color_rgb, (dot_x_px, dot_y_px), radius_px)
 
 
-def _print_route_plan_summary(tag: str, route_summary: RoutePlanSummary) -> None:
-    print(f"\n[{str(tag)}]")
-    print(
-        "route_found="
-        f"{bool(route_summary.route_found)} "
-        f"distance_to_destination_m={float(route_summary.distance_to_destination_m):.3f} "
-        f"next_macro_maneuver={str(route_summary.next_macro_maneuver)} "
-        f"optimal_lane_id={int(route_summary.optimal_lane_id)}"
-    )
-    print(
-        "start="
-        f"({str(route_summary.start_road_id)}, lane {int(route_summary.start_lane_id)}) "
-        "goal="
-        f"({str(route_summary.goal_road_id)}, lane {int(route_summary.goal_lane_id)})"
-    )
-    if int(getattr(route_summary, "start_graph_index", -1)) >= 0:
-        print(
-            "start_graph="
-            f"idx={int(getattr(route_summary, 'start_graph_index', -1))} "
-            f"query_distance_m={float(getattr(route_summary, 'start_query_distance_m', float('inf'))):.3f}"
-        )
-    if int(getattr(route_summary, "goal_graph_index", -1)) >= 0:
-        print(
-            "goal_graph="
-            f"idx={int(getattr(route_summary, 'goal_graph_index', -1))} "
-            f"query_distance_m={float(getattr(route_summary, 'goal_query_distance_m', float('inf'))):.3f}"
-        )
-    if str(getattr(route_summary, "debug_reason", "")).strip():
-        print(f"reason={str(getattr(route_summary, 'debug_reason', ''))}")
-    if list(getattr(route_summary, "road_options", []) or []):
-        print(f"road_options={list(getattr(route_summary, 'road_options', []) or [])}")
-    print(f"route_waypoint_count={len(route_summary.route_waypoints)}")
+def _split_projected_polyline_segments(
+    projected_points: Sequence[tuple[int, int] | None],
+) -> List[List[tuple[int, int]]]:
+    segments: List[List[tuple[int, int]]] = []
+    current_segment: List[tuple[int, int]] = []
+    for point_px in projected_points:
+        if point_px is None:
+            if len(current_segment) >= 2:
+                segments.append(list(current_segment))
+            current_segment = []
+            continue
+        current_segment.append((int(point_px[0]), int(point_px[1])))
+    if len(current_segment) >= 2:
+        segments.append(list(current_segment))
+    return segments
+
+
+def _split_route_world_segments(
+    route_points: Sequence[Sequence[float]],
+    *,
+    max_gap_m: float = 12.0,
+) -> List[List[tuple[float, float]]]:
+    segments: List[List[tuple[float, float]]] = []
+    current_segment: List[tuple[float, float]] = []
+    previous_point_xy: tuple[float, float] | None = None
+    gap_threshold_m = max(0.5, float(max_gap_m))
+
+    for point_xy in route_points:
+        if len(point_xy) < 2:
+            continue
+        current_point_xy = (float(point_xy[0]), float(point_xy[1]))
+        if (
+            previous_point_xy is not None
+            and math.hypot(
+                current_point_xy[0] - previous_point_xy[0],
+                current_point_xy[1] - previous_point_xy[1],
+            ) > gap_threshold_m
+        ):
+            if len(current_segment) >= 2:
+                segments.append(list(current_segment))
+            current_segment = []
+        current_segment.append(current_point_xy)
+        previous_point_xy = current_point_xy
+
+    if len(current_segment) >= 2:
+        segments.append(list(current_segment))
+    return segments
 
 
 def _draw_world_debug_route(world, carla, route_points: Sequence[Sequence[float]], life_time_s: float = 60.0) -> None:
@@ -430,27 +482,41 @@ def _draw_world_debug_route(world, carla, route_points: Sequence[Sequence[float]
     if debug is None:
         return
     yellow = carla.Color(255, 255, 0)
-    elevated_points = [
-        carla.Location(x=float(point_xy[0]), y=float(point_xy[1]), z=0.5)
-        for point_xy in route_points
-        if len(point_xy) >= 2
+    for segment_world_points in _split_route_world_segments(route_points):
+        elevated_points = [
+            carla.Location(x=float(point_xy[0]), y=float(point_xy[1]), z=0.5)
+            for point_xy in segment_world_points
+        ]
+        for idx, point in enumerate(elevated_points):
+            debug.draw_point(
+                point,
+                size=0.15,
+                color=yellow,
+                life_time=float(life_time_s),
+            )
+            if idx == 0:
+                continue
+            debug.draw_line(
+                elevated_points[idx - 1],
+                point,
+                thickness=0.1,
+                color=yellow,
+                life_time=float(life_time_s),
+            )
+
+
+def _route_points_for_visualization(
+    route_points: Sequence[Sequence[float]] | None,
+    *,
+    enabled: bool,
+) -> List[List[float]] | None:
+    if not bool(enabled) or route_points is None:
+        return None
+    return [
+        [float(point[0]), float(point[1])]
+        for point in route_points
+        if len(point) >= 2
     ]
-    for idx, point in enumerate(elevated_points):
-        debug.draw_point(
-            point,
-            size=0.15,
-            color=yellow,
-            life_time=float(life_time_s),
-        )
-        if idx == 0:
-            continue
-        debug.draw_line(
-            elevated_points[idx - 1],
-            point,
-            thickness=0.1,
-            color=yellow,
-            life_time=float(life_time_s),
-        )
 
 
 def _draw_planning_overlay(
@@ -470,27 +536,27 @@ def _draw_planning_overlay(
         return
 
     if global_route_points is not None and len(global_route_points) >= 2:
-        route_points_px: List[tuple[int, int]] = []
-        for point_xy in global_route_points:
-            if len(point_xy) < 2:
-                continue
-            pixel = _project_world_to_image(
-                camera_transform=camera_transform,
-                calibration_matrix=calibration_matrix,
-                world_xyz=[float(point_xy[0]), float(point_xy[1]), float(overlay_z_m)],
-                image_width_px=image_width_px,
-                image_height_px=image_height_px,
-            )
-            if pixel is not None:
-                route_points_px.append(pixel)
-        if len(route_points_px) >= 2:
-            _draw_dotted_polyline(
-                surface,
-                route_points_px,
-                color_rgb=(255, 220, 60),
-                dot_spacing_px=12,
-                radius_px=4,
-            )
+        for route_segment_world in _split_route_world_segments(global_route_points):
+            projected_points_px = [
+                _project_world_to_image(
+                    camera_transform=camera_transform,
+                    calibration_matrix=calibration_matrix,
+                    world_xyz=[float(point_xy[0]), float(point_xy[1]), float(overlay_z_m)],
+                    image_width_px=image_width_px,
+                    image_height_px=image_height_px,
+                )
+                for point_xy in route_segment_world
+            ]
+            for route_points_px in _split_projected_polyline_segments(projected_points_px):
+                if len(route_points_px) < 2:
+                    continue
+                _draw_dotted_polyline(
+                    surface,
+                    route_points_px,
+                    color_rgb=(255, 220, 60),
+                    dot_spacing_px=12,
+                    radius_px=4,
+                )
 
     if temporary_destination_state is not None and len(temporary_destination_state) >= 2:
         temp_destination_pixel = _project_world_to_image(
@@ -578,23 +644,24 @@ def _draw_hud_lines(surface, font, lines: Sequence[str], top_left_px: tuple[int,
         )
 
 
-def _render_topdown_camera(
+def _render_camera_pair(
     display,
-    image,
+    left_image,
+    right_image,
     topdown_overlay: Mapping[str, object] | None = None,
     hud_lines: Sequence[str] | None = None,
     hud_font=None,
 ):
     if pygame is None:
         return
-    if image is not None:
-        image_array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        image_array = image_array.reshape((image.height, image.width, 4))
-        image_rgb = image_array[:, :, :3][:, :, ::-1]
-        image_surface = pygame.surfarray.make_surface(image_rgb.swapaxes(0, 1))
+    if left_image is not None:
+        left_array = np.frombuffer(left_image.raw_data, dtype=np.uint8)
+        left_array = left_array.reshape((left_image.height, left_image.width, 4))
+        left_rgb = left_array[:, :, :3][:, :, ::-1]
+        left_surface = pygame.surfarray.make_surface(left_rgb.swapaxes(0, 1))
         if isinstance(topdown_overlay, Mapping):
             _draw_planning_overlay(
-                surface=image_surface,
+                surface=left_surface,
                 camera_transform=topdown_overlay["camera_transform"],
                 calibration_matrix=topdown_overlay["calibration_matrix"],
                 image_width_px=int(topdown_overlay["image_width_px"]),
@@ -605,7 +672,14 @@ def _render_topdown_camera(
                 planned_trajectory_states=topdown_overlay.get("planned_trajectory_states", None),
                 obstacle_field_contours=topdown_overlay.get("obstacle_field_contours", None),
             )
-        display.blit(image_surface, (0, 0))
+        display.blit(left_surface, (0, 0))
+
+    if right_image is not None:
+        right_array = np.frombuffer(right_image.raw_data, dtype=np.uint8)
+        right_array = right_array.reshape((right_image.height, right_image.width, 4))
+        right_rgb = right_array[:, :, :3][:, :, ::-1]
+        right_surface = pygame.surfarray.make_surface(right_rgb.swapaxes(0, 1))
+        display.blit(right_surface, (right_image.width, 0))
 
     if hud_lines:
         _draw_hud_lines(display, hud_font, hud_lines, (16, 16))
@@ -631,6 +705,419 @@ def _merge_tracker_predictions(
         ]
         merged.append(snapshot_copy)
     return merged
+
+
+def _call_with_supported_kwargs(func, **kwargs):
+    signature = inspect.signature(func)
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_var_kwargs:
+        return func(**kwargs)
+    supported_kwargs = {
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters
+    }
+    return func(**supported_kwargs)
+
+
+def _load_optional_module(*, module_name: str, purpose: str):
+    normalized_module_name = str(module_name).strip()
+    if not normalized_module_name:
+        return None
+    try:
+        return importlib.import_module(normalized_module_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to import {purpose} module '{normalized_module_name}': {exc}"
+        ) from exc
+
+
+def _initialize_scenario_runtime_state(
+    *,
+    module,
+    world,
+    world_map,
+    carla,
+    scenario_cfg: Mapping[str, object],
+):
+    if module is None:
+        return None
+    initialize_fn = getattr(module, "initialize_runtime", None)
+    if not callable(initialize_fn):
+        return None
+    return _call_with_supported_kwargs(
+        initialize_fn,
+        world=world,
+        world_map=world_map,
+        carla=carla,
+        scenario_cfg=scenario_cfg,
+    )
+
+
+def _apply_scenario_dynamic_obstacle_filter(
+    *,
+    module,
+    runtime_state,
+    world,
+    world_map,
+    carla,
+    scenario_cfg: Mapping[str, object],
+    object_snapshots: Sequence[Mapping[str, object]],
+    sim_time_s: float,
+) -> Tuple[List[dict], Any]:
+    snapshots_copy = [dict(snapshot) for snapshot in list(object_snapshots)]
+    if module is None:
+        return snapshots_copy, runtime_state
+
+    filter_fn = getattr(module, "filter_dynamic_obstacle_snapshots", None)
+    if not callable(filter_fn):
+        return snapshots_copy, runtime_state
+
+    filter_result = _call_with_supported_kwargs(
+        filter_fn,
+        world=world,
+        world_map=world_map,
+        carla=carla,
+        scenario_cfg=scenario_cfg,
+        runtime_state=runtime_state,
+        object_snapshots=snapshots_copy,
+        sim_time_s=float(sim_time_s),
+    )
+    if isinstance(filter_result, tuple) and len(filter_result) == 2:
+        filtered_snapshots, updated_runtime_state = filter_result
+    else:
+        filtered_snapshots = filter_result
+        updated_runtime_state = runtime_state
+    filtered_list = [dict(snapshot) for snapshot in list(filtered_snapshots or [])]
+    return filtered_list, updated_runtime_state
+
+
+def _maybe_apply_scenario_global_route_update(
+    *,
+    module,
+    runtime_state,
+    world,
+    world_map,
+    carla,
+    scenario_cfg: Mapping[str, object],
+    global_planner: AStarGlobalPlanner,
+    ego_transform,
+    goal_location,
+    object_snapshots: Sequence[Mapping[str, object]],
+    current_route_summary,
+    active_global_route_points: Sequence[Sequence[float]],
+    sim_time_s: float,
+) -> Tuple[object | None, List[List[float]] | None, Any]:
+    if module is None:
+        return None, None, runtime_state
+
+    update_fn = getattr(module, "maybe_replan_global_route", None)
+    if not callable(update_fn):
+        return None, None, runtime_state
+
+    update_result = _call_with_supported_kwargs(
+        update_fn,
+        world=world,
+        world_map=world_map,
+        carla=carla,
+        scenario_cfg=scenario_cfg,
+        runtime_state=runtime_state,
+        global_planner=global_planner,
+        ego_transform=ego_transform,
+        goal_location=goal_location,
+        object_snapshots=[dict(snapshot) for snapshot in list(object_snapshots or [])],
+        current_route_summary=current_route_summary,
+        active_global_route_points=[list(point) for point in list(active_global_route_points or [])],
+        sim_time_s=float(sim_time_s),
+    )
+    if isinstance(update_result, tuple):
+        if len(update_result) == 3:
+            route_summary, route_points, updated_runtime_state = update_result
+            return route_summary, route_points, updated_runtime_state
+        if len(update_result) == 2:
+            route_summary, route_points = update_result
+            return route_summary, route_points, runtime_state
+    if isinstance(update_result, Mapping):
+        return (
+            update_result.get("route_summary", None),
+            update_result.get("route_points", None),
+            update_result.get("runtime_state", runtime_state),
+        )
+    return None, None, runtime_state
+
+
+def _filter_obstacle_snapshots_by_vertical_overlap(
+    *,
+    ego_z_m: float,
+    ego_height_m: float,
+    object_snapshots: Sequence[Mapping[str, object]],
+    vertical_clearance_margin_m: float,
+    default_obstacle_height_m: float,
+) -> List[dict]:
+    filtered_snapshots: List[dict] = []
+    ego_height_value_m = max(0.5, float(ego_height_m))
+    margin_m = max(0.0, float(vertical_clearance_margin_m))
+    fallback_height_m = max(0.5, float(default_obstacle_height_m))
+
+    for snapshot in object_snapshots:
+        snapshot_copy = dict(snapshot)
+        obstacle_z_raw = snapshot_copy.get("z", None)
+        if obstacle_z_raw is None:
+            filtered_snapshots.append(snapshot_copy)
+            continue
+
+        obstacle_height_m = max(
+            0.5,
+            float(snapshot_copy.get("height_m", fallback_height_m)),
+        )
+        vertical_gap_m = abs(float(obstacle_z_raw) - float(ego_z_m))
+        overlap_threshold_m = 0.5 * (ego_height_value_m + obstacle_height_m) + margin_m
+        if vertical_gap_m <= overlap_threshold_m:
+            filtered_snapshots.append(snapshot_copy)
+
+    return filtered_snapshots
+
+
+def _road_numeric_id_from_context(local_context: Mapping[str, object] | None) -> int:
+    if not isinstance(local_context, Mapping):
+        return -1
+    raw_numeric_id = local_context.get("road_numeric_id", None)
+    if raw_numeric_id is not None:
+        try:
+            return int(raw_numeric_id)
+        except Exception:
+            pass
+    raw_road_id = str(local_context.get("road_id", "") or "").strip()
+    if ":" in raw_road_id:
+        raw_road_id = raw_road_id.split(":", 1)[0]
+    try:
+        return int(raw_road_id)
+    except Exception:
+        return -1
+
+
+def _same_lane_safety_corridor(
+    ego_lane_context: Mapping[str, object] | None,
+    obstacle_lane_context: Mapping[str, object] | None,
+) -> bool:
+    if not isinstance(ego_lane_context, Mapping) or not isinstance(obstacle_lane_context, Mapping):
+        return False
+    ego_direction = str(ego_lane_context.get("direction", "") or "").strip().lower()
+    obstacle_direction = str(obstacle_lane_context.get("direction", "") or "").strip().lower()
+    if ego_direction and obstacle_direction and ego_direction != obstacle_direction:
+        return False
+
+    ego_road_numeric_id = _road_numeric_id_from_context(ego_lane_context)
+    obstacle_road_numeric_id = _road_numeric_id_from_context(obstacle_lane_context)
+    if ego_road_numeric_id > 0 and obstacle_road_numeric_id > 0:
+        return int(ego_road_numeric_id) == int(obstacle_road_numeric_id)
+
+    ego_road_id = str(ego_lane_context.get("road_id", "") or "").strip()
+    obstacle_road_id = str(obstacle_lane_context.get("road_id", "") or "").strip()
+    if ego_road_id and obstacle_road_id:
+        return str(ego_road_id) == str(obstacle_road_id)
+    return False
+
+
+def _nearest_front_obstacle_by_lane(
+    *,
+    ego_snapshot: Mapping[str, float],
+    obstacle_snapshots: Sequence[Mapping[str, object]],
+    lane_assignments: Mapping[str, int],
+    available_lane_ids: Sequence[int],
+) -> Dict[int, dict]:
+    ego_x_m = float(ego_snapshot.get("x", 0.0))
+    ego_y_m = float(ego_snapshot.get("y", 0.0))
+    ego_psi_rad = float(ego_snapshot.get("psi", 0.0))
+    cos_heading = math.cos(float(ego_psi_rad))
+    sin_heading = math.sin(float(ego_psi_rad))
+
+    nearest_obstacles: Dict[int, dict] = {}
+    valid_lane_ids = {int(lane_id) for lane_id in list(available_lane_ids or [])}
+
+    for obstacle_snapshot in obstacle_snapshots:
+        obstacle_id = str(obstacle_snapshot.get("vehicle_id", ""))
+        lane_id = int(lane_assignments.get(obstacle_id, -1))
+        if lane_id not in valid_lane_ids:
+            continue
+
+        dx_m = float(obstacle_snapshot.get("x", 0.0)) - float(ego_x_m)
+        dy_m = float(obstacle_snapshot.get("y", 0.0)) - float(ego_y_m)
+        longitudinal_m = float(cos_heading) * float(dx_m) + float(sin_heading) * float(dy_m)
+        if float(longitudinal_m) < 0.0:
+            continue
+
+        previous_distance_m = float(
+            nearest_obstacles.get(int(lane_id), {}).get("front_distance_m", float("inf"))
+        )
+        if float(longitudinal_m) < float(previous_distance_m):
+            obstacle_copy = dict(obstacle_snapshot)
+            obstacle_copy["front_distance_m"] = float(longitudinal_m)
+            nearest_obstacles[int(lane_id)] = obstacle_copy
+
+    return nearest_obstacles
+
+
+def _nearest_front_obstacle_distance_by_lane(
+    *,
+    ego_snapshot: Mapping[str, float],
+    obstacle_snapshots: Sequence[Mapping[str, object]],
+    lane_assignments: Mapping[str, int],
+    available_lane_ids: Sequence[int],
+) -> Dict[int, float]:
+    nearest_obstacles = _nearest_front_obstacle_by_lane(
+        ego_snapshot=ego_snapshot,
+        obstacle_snapshots=obstacle_snapshots,
+        lane_assignments=lane_assignments,
+        available_lane_ids=available_lane_ids,
+    )
+    return {
+        int(lane_id): float(obstacle.get("front_distance_m", float("inf")))
+        for lane_id, obstacle in nearest_obstacles.items()
+    }
+
+
+def _should_force_intersection_reroute(
+    *,
+    mode: str,
+    ego_lane_id: int,
+    lane_safety_scores: Mapping[int, float],
+    nearest_front_obstacles_by_lane: Mapping[int, Mapping[str, object]],
+    safety_threshold: float,
+) -> bool:
+    if str(mode or "NORMAL").strip().upper() != "INTERSECTION":
+        return False
+    if int(ego_lane_id) not in nearest_front_obstacles_by_lane:
+        return False
+    return float(lane_safety_scores.get(int(ego_lane_id), 1.0)) < float(safety_threshold)
+
+
+def _static_obstacle_replan_candidate_lane_ids(
+    *,
+    current_lane_id: int,
+    available_lane_ids: Sequence[int],
+    lane_safety_scores: Mapping[int, float],
+) -> List[int]:
+    lane_ids = [int(lane_id) for lane_id in list(available_lane_ids or [])]
+    if len(lane_ids) == 0:
+        return []
+
+    normalized_current_lane_id = int(current_lane_id)
+    if normalized_current_lane_id not in lane_ids:
+        normalized_current_lane_id = min(
+            lane_ids,
+            key=lambda lane_id: abs(int(lane_id) - int(current_lane_id)),
+        )
+
+    alternative_lane_ids = [
+        lane_id
+        for lane_id in lane_ids
+        if int(lane_id) != int(normalized_current_lane_id)
+    ]
+    alternative_lane_ids.sort(
+        key=lambda lane_id: (
+            -float(lane_safety_scores.get(int(lane_id), 0.0)),
+            abs(int(lane_id) - int(normalized_current_lane_id)),
+            int(lane_id),
+        )
+    )
+    return list(alternative_lane_ids) + [int(normalized_current_lane_id)]
+
+
+def _replan_route_around_static_intersection_obstacle(
+    *,
+    global_planner: AStarGlobalPlanner,
+    ego_transform,
+    goal_location,
+    blocked_obstacle_snapshot: Mapping[str, object] | None,
+    blocked_lane_id: int,
+) -> tuple[object | None, List[List[float]]]:
+    if blocked_obstacle_snapshot is None:
+        return None, []
+
+    start_xy = [
+        float(ego_transform.location.x),
+        float(ego_transform.location.y),
+    ]
+    goal_xy = [
+        float(goal_location.x),
+        float(goal_location.y),
+    ]
+    blocked_point_xy = [
+        float(blocked_obstacle_snapshot.get("x", 0.0)),
+        float(blocked_obstacle_snapshot.get("y", 0.0)),
+    ]
+    obstacle_length_m = max(0.0, float(blocked_obstacle_snapshot.get("length_m", 4.5)))
+    obstacle_width_m = max(0.0, float(blocked_obstacle_snapshot.get("width_m", 2.0)))
+    block_radius_m = max(
+        6.0,
+        0.5 * max(float(obstacle_length_m), float(obstacle_width_m)) + 4.0,
+    )
+    route_summary = global_planner.plan_route_astar_avoiding_points(
+        start_xy=start_xy,
+        goal_xy=goal_xy,
+        blocked_points_xy=[blocked_point_xy],
+        blocked_lane_ids=[int(blocked_lane_id)],
+        block_radius_m=float(block_radius_m),
+        replace_stored_route=True,
+    )
+    if not bool(getattr(route_summary, "route_found", False)):
+        return None, []
+
+    route_points = [
+        [float(item[0]), float(item[1])]
+        for item in list(getattr(route_summary, "route_waypoints", []) or [])
+        if isinstance(item, Sequence) and len(item) >= 2
+    ]
+    if len(route_points) == 0:
+        return None, []
+    return route_summary, route_points
+
+
+def _apply_final_destination_snap(
+    *,
+    temporary_destination_state: Sequence[float] | None,
+    final_destination_state: Sequence[float],
+    ego_state: Sequence[float],
+    lock_to_final_distance_m: float,
+    original_max_velocity_mps: float,
+) -> tuple[List[float] | None, float]:
+    if temporary_destination_state is None:
+        return None, float(original_max_velocity_mps)
+    if len(temporary_destination_state) < 4 or len(final_destination_state) < 4:
+        return list(temporary_destination_state), float(original_max_velocity_mps)
+
+    snap_distance_threshold_m = max(0.0, float(lock_to_final_distance_m))
+    distance_temp_to_final_m = math.hypot(
+        float(temporary_destination_state[0]) - float(final_destination_state[0]),
+        float(temporary_destination_state[1]) - float(final_destination_state[1]),
+    )
+    if distance_temp_to_final_m > float(snap_distance_threshold_m):
+        return list(temporary_destination_state), float(original_max_velocity_mps)
+
+    snapped_destination_state = list(temporary_destination_state)
+    snapped_destination_state[0] = float(final_destination_state[0])
+    snapped_destination_state[1] = float(final_destination_state[1])
+    snapped_destination_state[2] = 0.0
+    snapped_destination_state[3] = float(final_destination_state[3])
+
+    if len(ego_state) < 2 or float(snap_distance_threshold_m) <= 1e-6:
+        active_max_velocity_mps = 0.0
+    else:
+        distance_ego_to_final_m = math.hypot(
+            float(ego_state[0]) - float(final_destination_state[0]),
+            float(ego_state[1]) - float(final_destination_state[1]),
+        )
+        stop_speed_scale = max(
+            0.0,
+            min(1.0, float(distance_ego_to_final_m) / float(snap_distance_threshold_m)),
+        )
+        active_max_velocity_mps = float(original_max_velocity_mps) * float(stop_speed_scale)
+
+    return snapped_destination_state, float(active_max_velocity_mps)
 
 
 def _sample_superellipse_contour_world(
@@ -686,10 +1173,12 @@ def _collect_vehicle_snapshots(world, ego_vehicle) -> List[dict]:
                 "vehicle_id": str(actor.attributes.get("role_name", actor.id)),
                 "x": float(transform.location.x),
                 "y": float(transform.location.y),
+                "z": float(transform.location.z),
                 "v": float(speed_mps),
                 "psi": float(math.radians(transform.rotation.yaw)),
                 "length_m": float(actor.bounding_box.extent.x * 2.0),
                 "width_m": float(actor.bounding_box.extent.y * 2.0),
+                "height_m": float(actor.bounding_box.extent.z * 2.0),
             }
         )
     return snapshots
@@ -714,10 +1203,12 @@ def _collect_environment_obstacle_snapshots(world, map_obj, carla, obstacle_pref
 
         half_length_m = 2.25
         half_width_m = 1.0
+        half_height_m = 1.0
         bbox = getattr(env_obj, "bounding_box", None)
         if bbox is not None:
             half_length_m = max(0.05, float(getattr(bbox.extent, "x", half_length_m)))
             half_width_m = max(0.05, float(getattr(bbox.extent, "y", half_width_m)))
+            half_height_m = max(0.05, float(getattr(bbox.extent, "z", half_height_m)))
 
         snapshots.append(
             {
@@ -729,6 +1220,7 @@ def _collect_environment_obstacle_snapshots(world, map_obj, carla, obstacle_pref
                 "psi": float(heading_rad),
                 "length_m": 2.0 * float(half_length_m),
                 "width_m": 2.0 * float(half_width_m),
+                "height_m": 2.0 * float(half_height_m),
                 "type": "static_obstacle",
                 "predicted_trajectory": _static_obstacle_prediction(
                     {
@@ -833,10 +1325,13 @@ def _destroy_actors(actors: Iterable[Any]) -> None:
 
 def _spawn_scenario_obstacles_from_module(
     *,
+    client,
     world,
     map_obj,
     carla,
     blueprint_library,
+    traffic_manager,
+    traffic_manager_port: int,
     scenario_cfg: Mapping[str, object],
     route_summary,
     route_points: Sequence[Sequence[float]],
@@ -850,12 +1345,10 @@ def _spawn_scenario_obstacles_from_module(
         "[CARLA SCENARIO] Spawning scenario obstacles after startup global route generation "
         f"using module '{module_name}'."
     )
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to import scenario obstacle spawner module '{module_name}': {exc}"
-        ) from exc
+    module = _load_optional_module(
+        module_name=str(module_name),
+        purpose="scenario obstacle spawner",
+    )
 
     spawn_fn = getattr(module, "spawn_obstacles", None)
     if not callable(spawn_fn):
@@ -864,11 +1357,15 @@ def _spawn_scenario_obstacles_from_module(
             "spawn_obstacles(...)."
         )
 
-    spawned_actors = spawn_fn(
+    spawned_actors = _call_with_supported_kwargs(
+        spawn_fn,
+        client=client,
         world=world,
         world_map=map_obj,
         carla=carla,
         blueprint_library=blueprint_library,
+        traffic_manager=traffic_manager,
+        traffic_manager_port=int(traffic_manager_port),
         scenario_cfg=scenario_cfg,
         route_summary=route_summary,
         route_points=route_points,
@@ -883,34 +1380,6 @@ def _spawn_scenario_obstacles_from_module(
     return actors
 
 
-def _latest_route_line(prompt_text: str) -> str:
-    for raw_line in str(prompt_text or "").splitlines():
-        line = str(raw_line).strip()
-        if line.lower().startswith("route = ["):
-            return line
-    return "route = [pending]"
-
-
-def _latest_prompt_line(prompt_text: str, prefix: str, default_text: str) -> str:
-    normalized_prefix = str(prefix).strip().lower()
-    for raw_line in str(prompt_text or "").splitlines():
-        line = str(raw_line).strip()
-        if line.lower().startswith(normalized_prefix):
-            return line
-    return str(default_text)
-
-
-def _default_lane_keep_decision(request_id: str = "0") -> BehaviorPlannerDecision:
-    return BehaviorPlannerDecision(
-        request_id=str(request_id),
-        behavior="LANE_KEEP",
-        target_v_mps=None,
-        reasoning="",
-        cav_broadcast={},
-        raw_response_text='{"id":"%s","behavior":"LANE_KEEP"}' % str(request_id),
-    )
-
-
 def _scenario_constraints_cfg(scenario_cfg: Mapping[str, object]) -> Dict[str, object]:
     constraints_cfg = dict(scenario_cfg.get("constraints", {}))
     missing_keys = [key for key in REQUIRED_CONSTRAINT_KEYS if key not in constraints_cfg]
@@ -922,109 +1391,6 @@ def _scenario_constraints_cfg(scenario_cfg: Mapping[str, object]) -> Dict[str, o
     return constraints_cfg
 
 
-def _behavior_planner_worker(
-    *,
-    stop_event: threading.Event,
-    shared_state: Dict[str, Any],
-    shared_lock: threading.Lock,
-    prompt_builder: BehaviorPlannerPromptBuilder,
-    api_client: BehaviorPlannerAPIClient | None,
-    system_instruction: str,
-    behavior_runtime_cfg: Mapping[str, object],
-    lane_center_waypoints: Sequence[Mapping[str, object]],
-    road_cfg: Mapping[str, object],
-    mpc_constraints: Mapping[str, object],
-    planner: AStarGlobalPlanner | None = None,
-    ego_vehicle_id: str = "Ego01",
-) -> None:
-    frequency_hz = float(max(0.1, behavior_runtime_cfg.get("frequency_hz", 1.0)))
-    period_s = 1.0 / frequency_hz
-    api_enabled = bool(behavior_runtime_cfg.get("api_enabled", False))
-    print_prompt = bool(behavior_runtime_cfg.get("print_prompt", True))
-    print_response = bool(behavior_runtime_cfg.get("print_response", True))
-    print_system_instruction = bool(behavior_runtime_cfg.get("print_system_instruction", False))
-
-    if print_system_instruction and len(system_instruction.strip()) > 0:
-        print("\n[CARLA BEHAVIOR PLANNER SYSTEM]")
-        print(system_instruction.strip())
-
-    if api_enabled and api_client is not None:
-        try:
-            api_client.prime_system_instruction(system_instruction)
-        except Exception as exc:  # pragma: no cover - runtime integration path
-            print(f"[CARLA BEHAVIOR PLANNER] Failed to prime system instruction: {exc}")
-
-    next_tick_wall_time_s = time.monotonic()
-    while not stop_event.is_set():
-        with shared_lock:
-            latest_inputs = shared_state.get("latest_inputs", None)
-            previous_behavior = str(
-                shared_state.get(
-                    "previous_behavior_for_prompt",
-                    shared_state.get("current_applied_behavior", "LANE_KEEP"),
-                )
-            )
-            prompt_seq = int(shared_state.get("prompt_seq", 0)) + 1
-            shared_state["prompt_seq"] = prompt_seq
-
-        if latest_inputs is not None:
-            prompt_text = prompt_builder.build_prompt(
-                ego_snapshot=dict(latest_inputs["ego_snapshot"]),
-                destination_state=list(latest_inputs["destination_state"]),
-                temporary_destination_state=list(latest_inputs["temporary_destination_state"]),
-                lane_center_waypoints=lane_center_waypoints,
-                object_snapshots=list(latest_inputs["object_snapshots"]),
-                road_cfg=road_cfg,
-                behavior_planner_runtime_cfg=dict(behavior_runtime_cfg),
-                ego_vehicle_id=ego_vehicle_id,
-                mpc_constraints=mpc_constraints,
-                prompt_id=prompt_seq,
-                previous_behavior=previous_behavior,
-                planner=planner,
-                route_summary=latest_inputs.get("route_summary", None),
-            )
-
-            with shared_lock:
-                shared_state["latest_prompt"] = prompt_text
-                shared_state["latest_prompt_id"] = str(prompt_seq)
-
-            if print_prompt:
-                print("\n[CARLA BEHAVIOR PLANNER INPUT]")
-                print(prompt_text)
-
-            if api_enabled and api_client is not None:
-                start_wall_time_s = time.monotonic()
-                try:
-                    raw_response_text, _response_id = api_client.request_decision(
-                        system_instruction=system_instruction,
-                        prompt=prompt_text,
-                    )
-                    latency_s = time.monotonic() - start_wall_time_s
-                    decision = parse_behavior_planner_response(raw_response_text)
-                    if str(decision.request_id) != str(prompt_seq):
-                        print(
-                            "[CARLA BEHAVIOR PLANNER] Ignoring mismatched response id "
-                            f"{decision.request_id!r} for prompt {prompt_seq}."
-                        )
-                    else:
-                        with shared_lock:
-                            shared_state["latest_decision"] = decision
-                            shared_state["previous_behavior_for_prompt"] = str(decision.behavior)
-                        if print_response:
-                            print("\n[CARLA BEHAVIOR PLANNER RESPONSE]")
-                            print(
-                                f"[CARLA BEHAVIOR PLANNER RESPONSE] seq={prompt_seq} "
-                                f"latency={latency_s:.3f}s"
-                            )
-                            print(raw_response_text)
-                except Exception as exc:  # pragma: no cover - runtime integration path
-                    print(f"[CARLA BEHAVIOR PLANNER] API request failed: {exc}")
-
-        next_tick_wall_time_s += period_s
-        wait_s = max(0.0, next_tick_wall_time_s - time.monotonic())
-        stop_event.wait(wait_s)
-
-
 def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -> int:
     scenario_cfg = dict(scenario_cfg or {})
     carla_cfg = dict(scenario_cfg.get("carla", {}))
@@ -1032,8 +1398,11 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
     planning_cfg = dict(scenario_cfg.get("planning", {}))
     camera_cfg = dict(scenario_cfg.get("camera", {}))
     obstacle_cfg = dict(scenario_cfg.get("obstacles", {}))
-    if bool(camera_cfg.get("enabled", True)) and pygame is None:
-        raise RuntimeError("pygame is required for the CARLA top-down scenario window.")
+    runtime_cfg = dict(scenario_cfg.get("runtime", {}))
+    traffic_manager_cfg = dict(scenario_cfg.get("traffic_manager", {}))
+
+    if pygame is None and bool(camera_cfg.get("enabled", True)):
+        raise RuntimeError("pygame is required for the two-camera CARLA scenario window.")
 
     world_map = world.get_map()
     blueprint_library = world.get_blueprint_library()
@@ -1046,6 +1415,11 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
     behavior_runtime_cfg = dict(mpc_cfg.get("behavior_planner_runtime", {}))
     local_goal_cfg = dict(mpc_cfg.get("local_goal", {}))
     mpc_constraints_cfg = dict(mpc_cfg.get("constraints", {}))
+    obstacle_filter_cfg = dict(mpc_cfg.get("obstacle_filter", {}))
+    visualization_cfg = dict(mpc_cfg.get("visualization", {}))
+    global_route_visualization_enabled = bool(
+        visualization_cfg.get("show_global_route", True)
+    )
 
     sample_distance_m = float(planning_cfg.get("waypoint_sample_distance_m", 2.0))
     lane_center_waypoints, road_cfg = build_lane_center_waypoints(
@@ -1061,16 +1435,9 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
 
     ego_anchor_name = str(anchors_cfg.get("ego_spawn", "cav_spawn"))
     destination_anchor_name = str(anchors_cfg.get("final_destination", "final_destination"))
-    print(
-        "[CARLA GLOBAL ROUTE OUTPUT] "
-        f"requested_start_anchor='{ego_anchor_name}' requested_goal_anchor='{destination_anchor_name}'"
-    )
-    _print_anchor_lookup(world, carla, ego_anchor_name)
-    _print_anchor_lookup(world, carla, destination_anchor_name)
     global_route_start_location = _get_location_from_anchor(world, carla, ego_anchor_name)
     global_route_goal_location = _get_location_from_anchor(world, carla, destination_anchor_name)
     if global_route_start_location is None or global_route_goal_location is None:
-        print("[CARLA GLOBAL ROUTE OUTPUT] Error: Could not find one or both anchor points.")
         raise RuntimeError(
             "Could not find the required global-route anchors. "
             f"ego_spawn='{ego_anchor_name}' final_destination='{destination_anchor_name}'."
@@ -1082,12 +1449,6 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
     if spawn_waypoint is None or destination_waypoint is None:
         raise RuntimeError("Could not align the spawn or destination anchors to a driving lane.")
 
-    print(
-        "[CARLA GLOBAL ROUTE OUTPUT] "
-        f"query_start_xy={[float(global_route_start_location.x), float(global_route_start_location.y)]} "
-        f"query_goal_xy={[float(global_route_goal_location.x), float(global_route_goal_location.y)]}"
-    )
-    print("[CARLA GLOBAL ROUTE OUTPUT] Planning route with CARLA GlobalRoutePlanner.trace_route(...)")
     initial_global_route_summary = global_planner.plan_route_from_locations(
         start_location=global_route_start_location,
         goal_location=global_route_goal_location,
@@ -1100,30 +1461,13 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
             float(global_route_goal_location.y),
         ],
     )
-    _print_route_plan_summary("CARLA GLOBAL ROUTE OUTPUT", initial_global_route_summary)
     initial_route_points: List[List[float]] = []
     if bool(initial_global_route_summary.route_found):
         initial_route_points = [
             [float(item[0]), float(item[1])]
             for item in initial_global_route_summary.route_waypoints
         ]
-        print(f"[CARLA GLOBAL ROUTE OUTPUT] Visualizing {len(initial_route_points)} waypoints in yellow.")
-        _draw_world_debug_route(
-            world=world,
-            carla=carla,
-            route_points=initial_route_points,
-            life_time_s=60.0,
-        )
-    else:
-        print(
-            "[CARLA GLOBAL ROUTE OUTPUT] No CARLA GlobalRoutePlanner route was found. "
-            "No yellow dotted route will be drawn."
-        )
     topdown_focus_points: List[List[float]] = list(initial_route_points)
-    print(
-        "[CARLA GLOBAL ROUTE OUTPUT] "
-        f"yellow_route_point_count={len(initial_route_points)}"
-    )
     if len(topdown_focus_points) == 0:
         topdown_focus_points = [
             [float(global_route_start_location.x), float(global_route_start_location.y)],
@@ -1137,13 +1481,21 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
         spawn_transform=aligned_spawn_transform,
     )
 
+    traffic_manager = None
+    traffic_manager_port = int(traffic_manager_cfg.get("port", 8000))
+    if bool(traffic_manager_cfg.get("enabled", False)):
+        traffic_manager = client.get_trafficmanager(int(traffic_manager_port))
+
     actors_to_destroy = [ego_vehicle]
     actors_to_destroy.extend(
         _spawn_scenario_obstacles_from_module(
+            client=client,
             world=world,
             map_obj=world_map,
             carla=carla,
             blueprint_library=blueprint_library,
+            traffic_manager=traffic_manager,
+            traffic_manager_port=int(traffic_manager_port),
             scenario_cfg=scenario_cfg,
             route_summary=initial_global_route_summary,
             route_points=initial_route_points,
@@ -1152,25 +1504,28 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
     previous_settings = world.get_settings()
     settings = world.get_settings()
     settings.synchronous_mode = bool(carla_cfg.get("synchronous_mode", True))
-    settings.fixed_delta_seconds = float(carla_cfg.get("fixed_delta_seconds", 0.05))
+    settings.fixed_delta_seconds = CARLA_FIXED_DELTA_SECONDS
     world.apply_settings(settings)
-    carla_plan_dt_s = world.get_settings().fixed_delta_seconds
-    if carla_plan_dt_s is not None and float(carla_plan_dt_s) > 0.0:
-        configured_plan_dt_s = float(mpc_cfg.get("plan_dt_s", carla_plan_dt_s))
-        if abs(float(configured_plan_dt_s) - float(carla_plan_dt_s)) > 1e-9:
-            print(
-                "[CARLA SCENARIO] Overriding mpc.plan_dt_s "
-                f"from {configured_plan_dt_s:.6f}s to CARLA fixed_delta_seconds={float(carla_plan_dt_s):.6f}s"
+    if traffic_manager is not None:
+        try:
+            traffic_manager.set_synchronous_mode(
+                bool(traffic_manager_cfg.get("synchronous_mode", settings.synchronous_mode))
             )
-        mpc_cfg["plan_dt_s"] = float(carla_plan_dt_s)
+        except Exception:
+            pass
+    print(
+        f"[CARLA SCENARIO] Simulation tick = {CARLA_FIXED_DELTA_SECONDS:.3f}s "
+        f"({1.0 / CARLA_FIXED_DELTA_SECONDS:.0f} Hz), "
+        f"MPC prediction dt = {float(mpc_cfg.get('plan_dt_s', 0.2)):.3f}s"
+    )
     realtime_pacing_enabled = bool(carla_cfg.get("realtime_pacing_enabled", False))
     realtime_pacing_factor = max(1e-3, float(carla_cfg.get("realtime_pacing_factor", 1.0)))
     realtime_loop_period_s = 0.0
-    if realtime_pacing_enabled and carla_plan_dt_s is not None and float(carla_plan_dt_s) > 0.0:
-        realtime_loop_period_s = float(carla_plan_dt_s) / float(realtime_pacing_factor)
+    if realtime_pacing_enabled:
+        realtime_loop_period_s = CARLA_FIXED_DELTA_SECONDS / float(realtime_pacing_factor)
         print(
             "[CARLA SCENARIO] Real-time pacing enabled "
-            f"(wall_period={float(realtime_loop_period_s):.3f}s sim_dt={float(carla_plan_dt_s):.3f}s factor={float(realtime_pacing_factor):.3f})"
+            f"(wall_period={float(realtime_loop_period_s):.3f}s sim_dt={CARLA_FIXED_DELTA_SECONDS:.3f}s factor={float(realtime_pacing_factor):.3f})"
         )
 
     image_width_px = int(camera_cfg.get("image_size_x", 960))
@@ -1190,15 +1545,18 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
 
     topdown_camera = None
     topdown_queue = None
+    chase_camera = None
+    chase_queue = None
     display = None
 
     if bool(camera_cfg.get("enabled", True)):
         pygame.init()
         pygame.font.init()
-        display = pygame.display.set_mode((int(image_width_px), int(image_height_px)))
-        pygame.display.set_caption(f"CARLA {scenario_cfg.get('name', 'scenario')} - Topdown")
+        display = pygame.display.set_mode((int(image_width_px * 2), int(image_height_px)))
+        pygame.display.set_caption(f"CARLA {scenario_cfg.get('name', 'scenario')} - Topdown | Chase")
 
         topdown_cfg = dict(camera_cfg.get("topdown", {}))
+        chase_cfg = dict(camera_cfg.get("chase", {}))
         topdown_world_fixed = bool(topdown_cfg.get("world_fixed", False))
         if topdown_world_fixed:
             topdown_transform = _world_fixed_topdown_transform(
@@ -1215,6 +1573,18 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                 carla.Location(x=0.0, y=0.0, z=float(topdown_cfg.get("height", 65.0))),
                 carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0),
             )
+        chase_transform = carla.Transform(
+            carla.Location(
+                x=-float(chase_cfg.get("back", 8.0)),
+                y=0.0,
+                z=float(chase_cfg.get("height", 2.8)),
+            ),
+            carla.Rotation(
+                pitch=float(chase_cfg.get("pitch", -10.0)),
+                yaw=0.0,
+                roll=0.0,
+            ),
+        )
         topdown_camera, topdown_queue = _spawn_camera(
             world,
             carla,
@@ -1222,22 +1592,31 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
             topdown_transform,
             parent=None if topdown_world_fixed else ego_vehicle,
         )
-        actors_to_destroy.append(topdown_camera)
+        chase_camera, chase_queue = _spawn_camera(
+            world,
+            carla,
+            camera_blueprint,
+            chase_transform,
+            parent=ego_vehicle,
+        )
+        actors_to_destroy.extend([topdown_camera, chase_camera])
     hud_font = pygame.font.SysFont("monospace", 18) if display is not None else None
 
-    prompt_builder = BehaviorPlannerPromptBuilder()
     tracker = Tracker(tracker_cfg=tracker_cfg)
     mpc = MPC(mpc_cfg=mpc_cfg, road_cfg=road_cfg)
-    behavior_api_client = None
-    if bool(behavior_runtime_cfg.get("enabled", False)) and bool(behavior_runtime_cfg.get("api_enabled", False)):
-        behavior_api_client = BehaviorPlannerAPIClient(
-            api_key_env_var=str(behavior_runtime_cfg.get("api_key_env_var", "OPENAI_API_KEY")),
-            model=str(behavior_runtime_cfg.get("model", "gpt-4o")),
-            temperature=float(behavior_runtime_cfg.get("temperature", 0.0)),
-            request_timeout_s=float(behavior_runtime_cfg.get("request_timeout_s", 30.0)),
-            max_output_tokens=int(behavior_runtime_cfg.get("max_output_tokens", 80)),
-            enabled=bool(behavior_runtime_cfg.get("api_enabled", True)),
-        )
+    obstacle_height_filter_enabled = bool(obstacle_filter_cfg.get("enable_height_filter", True))
+    obstacle_vertical_clearance_margin_m = float(
+        obstacle_filter_cfg.get("vertical_clearance_margin_m", 1.0)
+    )
+    default_obstacle_height_m = float(
+        obstacle_filter_cfg.get("default_obstacle_height_m", 2.0)
+    )
+    ego_bbox = getattr(ego_vehicle, "bounding_box", None)
+    ego_bbox_extent = getattr(ego_bbox, "extent", None)
+    ego_height_m = max(
+        0.5,
+        float(getattr(ego_bbox_extent, "z", 0.9)) * 2.0,
+    )
 
     final_destination_state = [
         float(aligned_destination_transform.location.x),
@@ -1249,65 +1628,166 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
         x_m=float(aligned_spawn_transform.location.x),
         y_m=float(aligned_spawn_transform.location.y),
         heading_rad=float(math.radians(aligned_spawn_transform.rotation.yaw)),
+        z_m=float(aligned_spawn_transform.location.z),
     )
     initial_lane_count = int(initial_lane_context.get("lane_count", 0))
     if initial_lane_count > 0:
         road_cfg["lane_count"] = int(initial_lane_count)
-    selected_lane_id = int(initial_lane_context.get("lane_id", 1))
     lane_count = max(1, int(road_cfg.get("lane_count", 1)))
-    current_applied_behavior = "LANE_KEEP"
-    latest_decision = _default_lane_keep_decision(request_id="0")
-    last_applied_decision_id = str(latest_decision.request_id)
-    current_target_v_mps = float(local_goal_cfg.get("v_ref_mps", 10.0))
-    current_max_velocity_override_mps: float | None = None
+    initial_allowed_lane_ids = _allowed_lane_ids_from_context(
+        local_context=initial_lane_context,
+        fallback_lane_count=int(lane_count),
+    )
+    selected_lane_id = _clamp_lane_id_to_allowed(
+        int(initial_lane_context.get("lane_id", 1)),
+        initial_allowed_lane_ids,
+    )
+    current_applied_behavior = "lane_follow"
     original_max_velocity_mps = float(mpc.constraints.max_velocity_mps)
-    saved_max_velocity_before_emergency_mps: float | None = None
+    current_target_v_mps = float(original_max_velocity_mps)
+    lane_scores: Dict[int, float] = {
+        int(lane_id): 1.0 for lane_id in initial_allowed_lane_ids
+    }
+    current_route_optimal_lane_id = _clamp_optional_lane_id_to_allowed(
+        getattr(initial_global_route_summary, "optimal_lane_id", -1),
+        initial_allowed_lane_ids,
+    )
+    display_reference_maneuver = normalize_macro_maneuver(
+        getattr(initial_global_route_summary, "next_macro_maneuver", "straight")
+    )
 
     current_acceleration_mps2 = 0.0
     current_steering_rad = 0.0
-    route_rebuild_period_s = float(planning_cfg.get("route_rebuild_period_s", 1.0))
-    last_route_rebuild_wall_time_s = -1.0
-    initial_global_route_points: List[List[float]] = list(initial_route_points)
-    base_route_summary = initial_global_route_summary
-    maneuver_route_summary = initial_global_route_summary
+    active_global_route_points: List[List[float]] = list(initial_route_points)
+    current_route_summary = initial_global_route_summary
+    temporary_route_summary = initial_global_route_summary
+    active_reference_maneuver = normalize_macro_maneuver(
+        getattr(initial_global_route_summary, "next_macro_maneuver", "straight")
+    )
     temporary_destination_state: List[float] | None = None
     planned_trajectory: List[List[float]] = []
     cached_control_sequence: np.ndarray | None = None
     cached_control_step_idx = 0
-    last_mpc_replan_sim_time_s = -1.0
-    behavior_stop_event = threading.Event()
-    behavior_shared_lock = threading.Lock()
-    behavior_shared_state: Dict[str, Any] = {
-        "latest_inputs": None,
-        "latest_prompt": "",
-        "latest_prompt_id": "0",
-        "latest_decision": latest_decision,
-        "prompt_seq": 0,
-        "current_applied_behavior": current_applied_behavior,
-        "previous_behavior_for_prompt": current_applied_behavior,
-    }
-    behavior_thread = None
-    if bool(behavior_runtime_cfg.get("enabled", False)):
-        system_instruction = prompt_builder.load_system_instruction()
-        behavior_thread = threading.Thread(
-            target=_behavior_planner_worker,
-            kwargs={
-                "stop_event": behavior_stop_event,
-                "shared_state": behavior_shared_state,
-                "shared_lock": behavior_shared_lock,
-                "prompt_builder": prompt_builder,
-                "api_client": behavior_api_client,
-                "system_instruction": system_instruction,
-                "behavior_runtime_cfg": behavior_runtime_cfg,
-                "lane_center_waypoints": lane_center_waypoints,
-                "road_cfg": road_cfg,
-                "mpc_constraints": mpc_constraints_cfg,
-                "planner": global_planner,
-                "ego_vehicle_id": "Ego01",
-            },
-            daemon=True,
+    last_world_debug_route_draw_time_s = -float("inf")
+
+    # ---- Rule-based behavior planner -------------------------------- #
+    rule_planner_cfg = dict(behavior_runtime_cfg.get("rule_based", {}))
+    lane_safety_scorer = LaneSafetyScorer(
+        d_safe_m=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_safety_distance_safe_m",
+                legacy_key="d_safe_m",
+                default=12.0,
+            )
+        ),
+        ttc_safe_s=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_safety_ttc_safe_s",
+                legacy_key="ttc_safe_s",
+                default=3.0,
+            )
+        ),
+        sigmoid_k=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_safety_ttc_sigmoid_gain",
+                legacy_key="sigmoid_k",
+                default=2.0,
+            )
+        ),
+        ttc_history_size=int(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_safety_ttc_history_length",
+                legacy_key="ttc_history_size",
+                default=8,
+            )
+        ),
+    )
+    rule_planner = RuleBasedBehaviorPlanner(
+        hysteresis_delta=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="decision_hysteresis_delta",
+                legacy_key="hysteresis_delta",
+                default=0.10,
+            )
+        ),
+        lateral_complete_m=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_change_completion_lateral_threshold_m",
+                legacy_key="lateral_complete_m",
+                default=0.75,
+            )
+        ),
+        heading_complete_rad=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_change_completion_heading_threshold_rad",
+                legacy_key="heading_complete_rad",
+                default=0.20,
+            )
+        ),
+        lane_change_target_safety_threshold=float(
+            _behavior_runtime_value(
+                behavior_runtime_cfg,
+                rule_planner_cfg,
+                key="lane_change_target_safety_threshold",
+                legacy_key="intersection_lane_change_safety_threshold",
+                default=0.10,
+            )
+        ),
+    )
+    moving_obstacle_speed_threshold_mps = float(
+        _behavior_runtime_value(
+            behavior_runtime_cfg,
+            rule_planner_cfg,
+            key="intersection_obstacle_moving_speed_threshold_mps",
+            legacy_key="intersection_obstacle_moving_speed_threshold_mps",
+            default=0.5,
         )
-        behavior_thread.start()
+    )
+    static_obstacle_replan_lane_safety_threshold = float(
+        _behavior_runtime_value(
+            behavior_runtime_cfg,
+            rule_planner_cfg,
+            key="intersection_static_obstacle_replan_lane_safety_threshold",
+            legacy_key="intersection_static_obstacle_replan_lane_safety_threshold",
+            default=0.5,
+        )
+    )
+    static_obstacle_replan_cooldown_s = float(
+        _behavior_runtime_value(
+            behavior_runtime_cfg,
+            rule_planner_cfg,
+            key="intersection_static_obstacle_replan_cooldown_s",
+            legacy_key="intersection_static_obstacle_replan_cooldown_s",
+            default=1.0,
+        )
+    )
+    last_static_intersection_replan_time_s = -float("inf")
+    print("[CARLA SCENARIO] Rule-based behavior planner initialized.")
+    scenario_runtime_module = _load_optional_module(
+        module_name=str(runtime_cfg.get("module", "")).strip(),
+        purpose="scenario runtime",
+    )
+    scenario_runtime_state = _initialize_scenario_runtime_state(
+        module=scenario_runtime_module,
+        world=world,
+        world_map=world_map,
+        carla=carla,
+        scenario_cfg=scenario_cfg,
+    )
 
     try:
         obstacle_prefix = str(obstacle_cfg.get("environment_name_prefix", "")).strip()
@@ -1330,6 +1810,20 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                     f"size=({snapshot['length_m']:.2f}m, {snapshot['width_m']:.2f}m)"
                 )
         next_tick_wall_time_s = time.monotonic()
+        # Cached planning state (updated at MPC replan rate, not every tick)
+        rolling_target_distance_m = float(local_goal_cfg.get("dynamic_lookahead_min_distance_m", 20.0))
+        ego_snapshot: Dict[str, float] = {
+            "x": float(aligned_spawn_transform.location.x),
+            "y": float(aligned_spawn_transform.location.y),
+            "v": 0.0,
+            "psi": float(math.radians(aligned_spawn_transform.rotation.yaw)),
+        }
+        base_destination_state: List[float] = list(final_destination_state) + [0.0]
+        target_distance_for_destination_m = float(rolling_target_distance_m)
+        local_allowed_lane_ids = list(initial_allowed_lane_ids)
+        cached_obstacle_contours: List[dict] = []
+        cached_hud_temp_lane_prompt = 1
+        render_tick_counter = 0
         while True:
             if realtime_loop_period_s > 0.0:
                 now_wall_time_s = time.monotonic()
@@ -1354,226 +1848,479 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                 print("Reached final destination.")
                 return 0
 
-            now_wall_time_s = time.monotonic()
-            route_rebuild_due = False
-            if last_route_rebuild_wall_time_s < 0.0 or (now_wall_time_s - last_route_rebuild_wall_time_s) >= route_rebuild_period_s:
-                last_route_rebuild_wall_time_s = now_wall_time_s
-                route_rebuild_due = True
-
-            current_lane_context = global_planner.get_local_lane_context(
-                x_m=float(ego_state[0]),
-                y_m=float(ego_state[1]),
-                heading_rad=float(ego_state[3]),
-            )
-            current_lane_id = int(current_lane_context.get("lane_id", selected_lane_id))
-            local_allowed_lane_ids = _allowed_lane_ids_from_context(
-                local_context=current_lane_context,
-                fallback_lane_count=int(lane_count),
-            )
-            local_lane_count = len(local_allowed_lane_ids)
-            if int(current_lane_id) <= 0:
-                current_lane_id = _clamp_lane_id_to_allowed(selected_lane_id, local_allowed_lane_ids)
-            selected_lane_id = _clamp_lane_id_to_allowed(selected_lane_id, local_allowed_lane_ids)
-
-            dynamic_object_snapshots = _collect_vehicle_snapshots(world, ego_vehicle)
-            static_object_snapshots = list(cached_static_environment_obstacles)
             sim_time_s = float(world.get_snapshot().timestamp.elapsed_seconds)
-            tracker.update(obstacle_snapshots=dynamic_object_snapshots, timestamp_s=sim_time_s)
-            predicted_snapshots = _merge_tracker_predictions(
-                object_snapshots=dynamic_object_snapshots,
-                predictions=tracker.predict(step_dt_s=float(mpc.dt_s), horizon_s=float(mpc.horizon_s)),
-            )
-            predicted_snapshots.extend(list(static_object_snapshots))
+            if (
+                bool(global_route_visualization_enabled)
+                and len(active_global_route_points) > 0
+                and (
+                    float(sim_time_s) - float(last_world_debug_route_draw_time_s)
+                ) >= float(WORLD_DEBUG_ROUTE_REFRESH_PERIOD_S)
+            ):
+                _draw_world_debug_route(
+                    world=world,
+                    carla=carla,
+                    route_points=active_global_route_points,
+                    life_time_s=float(WORLD_DEBUG_ROUTE_LIFE_TIME_S),
+                )
+                last_world_debug_route_draw_time_s = float(sim_time_s)
 
-            base_target_lane_id = (
-                int(current_lane_id)
-                if int(current_lane_id) > 0
-                else min(max(1, int(selected_lane_id)), int(lane_count))
+            # Tracker update every tick for accuracy; predictions only at replan
+            dynamic_object_snapshots, scenario_runtime_state = _apply_scenario_dynamic_obstacle_filter(
+                module=scenario_runtime_module,
+                runtime_state=scenario_runtime_state,
+                world=world,
+                world_map=world_map,
+                carla=carla,
+                scenario_cfg=scenario_cfg,
+                object_snapshots=_collect_vehicle_snapshots(world, ego_vehicle),
+                sim_time_s=float(sim_time_s),
             )
-            base_lookahead_distance_raw_m = compute_lane_lookahead_distance(
-                ego_state=ego_state,
-                lane_center_waypoints=lane_center_waypoints,
-                target_lane_id=int(base_target_lane_id),
-                local_goal_cfg=local_goal_cfg,
+            scenario_route_summary, scenario_route_points, scenario_runtime_state = _maybe_apply_scenario_global_route_update(
+                module=scenario_runtime_module,
+                runtime_state=scenario_runtime_state,
+                world=world,
+                world_map=world_map,
+                carla=carla,
+                scenario_cfg=scenario_cfg,
+                global_planner=global_planner,
+                ego_transform=ego_vehicle.get_transform(),
+                goal_location=aligned_destination_transform.location,
+                object_snapshots=dynamic_object_snapshots,
+                current_route_summary=current_route_summary,
+                active_global_route_points=active_global_route_points,
+                sim_time_s=float(sim_time_s),
             )
-            rolling_target_distance_m = float(
-                max(
-                    1.0,
-                    round(
-                        float(
-                            base_lookahead_distance_raw_m
-                            if base_lookahead_distance_raw_m is not None
-                            else local_goal_cfg.get("dynamic_lookahead_min_distance_m", 20.0)
+            if scenario_route_summary is not None and scenario_route_points is not None:
+                if len(scenario_route_points) > 0:
+                    active_global_route_points = [
+                        [float(point[0]), float(point[1])]
+                        for point in list(scenario_route_points)
+                        if isinstance(point, Sequence) and len(point) >= 2
+                    ]
+                current_route_summary = scenario_route_summary
+            tracker.update(obstacle_snapshots=dynamic_object_snapshots, timestamp_s=sim_time_s)
+
+            # --- Heavy planning: only at MPC replan rate ---
+            if mpc.should_replan(sim_time_s):
+                static_object_snapshots = list(cached_static_environment_obstacles)
+                predicted_snapshots = _merge_tracker_predictions(
+                    object_snapshots=dynamic_object_snapshots,
+                    predictions=tracker.predict(step_dt_s=float(mpc.dt_s), horizon_s=float(mpc.horizon_s)),
+                )
+                predicted_snapshots.extend(list(static_object_snapshots))
+                ego_transform = ego_vehicle.get_transform()
+                ego_z_m = float(ego_transform.location.z)
+                if obstacle_height_filter_enabled:
+                    predicted_snapshots = _filter_obstacle_snapshots_by_vertical_overlap(
+                        ego_z_m=float(ego_z_m),
+                        ego_height_m=float(ego_height_m),
+                        object_snapshots=predicted_snapshots,
+                        vertical_clearance_margin_m=float(obstacle_vertical_clearance_margin_m),
+                        default_obstacle_height_m=float(default_obstacle_height_m),
+                    )
+
+                # Cheap O(N) lookup on stored initial route (no A* replan)
+                current_route_summary = global_planner.get_current_route_info(
+                    x_m=float(ego_state[0]),
+                    y_m=float(ego_state[1]),
+                    query_key="ego",
+                )
+
+                current_lane_context = global_planner.get_local_lane_context(
+                    x_m=float(ego_state[0]),
+                    y_m=float(ego_state[1]),
+                    heading_rad=float(ego_state[3]),
+                    z_m=float(ego_z_m),
+                )
+                current_lane_id = int(current_lane_context.get("lane_id", selected_lane_id))
+                local_allowed_lane_ids = _allowed_lane_ids_from_context(
+                    local_context=current_lane_context,
+                    fallback_lane_count=int(lane_count),
+                )
+                local_lane_count = len(local_allowed_lane_ids)
+                if int(current_lane_id) <= 0:
+                    current_lane_id = _clamp_lane_id_to_allowed(selected_lane_id, local_allowed_lane_ids)
+                selected_lane_id = _clamp_lane_id_to_allowed(selected_lane_id, local_allowed_lane_ids)
+
+                base_target_lane_id = (
+                    int(current_lane_id)
+                    if int(current_lane_id) > 0
+                    else min(max(1, int(selected_lane_id)), int(lane_count))
+                )
+                base_lookahead_distance_raw_m = compute_lane_lookahead_distance(
+                    ego_state=ego_state,
+                    lane_center_waypoints=lane_center_waypoints,
+                    target_lane_id=int(base_target_lane_id),
+                    local_goal_cfg=local_goal_cfg,
+                )
+                rolling_target_distance_m = float(
+                    max(
+                        1.0,
+                        round(
+                            float(
+                                base_lookahead_distance_raw_m
+                                if base_lookahead_distance_raw_m is not None
+                                else local_goal_cfg.get("dynamic_lookahead_min_distance_m", 20.0)
+                            )
+                        ),
+                    )
+                )
+                ego_snapshot = {
+                    "x": float(ego_state[0]),
+                    "y": float(ego_state[1]),
+                    "v": float(ego_state[2]),
+                    "psi": float(ego_state[3]),
+                }
+                # ---- Assign obstacles to lanes (for safety thread) ---- #
+                lane_assignments: Dict[str, int] = {}
+                lane_safety_obstacle_snapshots: List[dict] = []
+                for obs in predicted_snapshots:
+                    obs_id = str(obs.get("vehicle_id", ""))
+                    obs_ctx = global_planner.get_local_lane_context(
+                        x_m=float(obs.get("x", 0.0)),
+                        y_m=float(obs.get("y", 0.0)),
+                        heading_rad=float(obs.get("psi", 0.0)),
+                        z_m=float(obs.get("z", 0.0)) if obs.get("z", None) is not None else None,
+                    )
+                    if _same_lane_safety_corridor(current_lane_context, obs_ctx):
+                        lane_assignments[obs_id] = int(obs_ctx.get("lane_id", -1))
+                        lane_safety_obstacle_snapshots.append(dict(obs))
+                    else:
+                        lane_assignments[obs_id] = -1
+
+                raw_lane_scores = lane_safety_scorer.compute_lane_scores(
+                    ego_snapshot=ego_snapshot,
+                    obstacle_snapshots=lane_safety_obstacle_snapshots,
+                    lane_assignments=lane_assignments,
+                    ego_lane_id=int(current_lane_id),
+                    available_lane_ids=local_allowed_lane_ids,
+                    timestamp_s=sim_time_s,
+                )
+                lane_safety_scorer.cleanup_stale_obstacles(
+                    {
+                        str(snapshot.get("vehicle_id", ""))
+                        for snapshot in lane_safety_obstacle_snapshots
+                    }
+                )
+                lane_scores = {
+                    int(lane_id): float(raw_lane_scores.get(lane_id, 1.0))
+                    for lane_id in local_allowed_lane_ids
+                }
+                nearest_front_obstacles_by_lane = _nearest_front_obstacle_by_lane(
+                    ego_snapshot=ego_snapshot,
+                    obstacle_snapshots=lane_safety_obstacle_snapshots,
+                    lane_assignments=lane_assignments,
+                    available_lane_ids=local_allowed_lane_ids,
+                )
+                front_obstacle_distance_by_lane = _nearest_front_obstacle_distance_by_lane(
+                    ego_snapshot=ego_snapshot,
+                    obstacle_snapshots=lane_safety_obstacle_snapshots,
+                    lane_assignments=lane_assignments,
+                    available_lane_ids=local_allowed_lane_ids,
+                )
+
+                # ---- Ego lane offset for lane-change completion ------ #
+                ego_offset_info = compute_ego_lane_offset(world_map, carla, ego_transform)
+
+                # ---- Blue-dot route context and mode ----------------- #
+                _prev_dest_xy = (
+                    (float(temporary_destination_state[0]), float(temporary_destination_state[1]))
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 2
+                    else None
+                )
+                _prev_mode = (
+                    float(temporary_destination_state[5])
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 6
+                    else None
+                )
+                _prev_road_id = (
+                    int(temporary_destination_state[6])
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 7
+                    else None
+                )
+                _prev_entered_intersection = (
+                    float(temporary_destination_state[7]) > 0.5
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 8
+                    else False
+                )
+                planning_temporary_route_summary = current_route_summary
+                if _prev_dest_xy is not None:
+                    planning_temporary_route_summary = global_planner.get_current_route_info(
+                        x_m=float(_prev_dest_xy[0]),
+                        y_m=float(_prev_dest_xy[1]),
+                        query_key="blue_dot",
+                    )
+                planning_next_maneuver = normalize_macro_maneuver(
+                    getattr(planning_temporary_route_summary, "next_macro_maneuver", "straight")
+                )
+                planning_optimal_lane_id = _clamp_optional_lane_id_to_allowed(
+                    getattr(planning_temporary_route_summary, "optimal_lane_id", -1),
+                    local_allowed_lane_ids,
+                )
+                raw_temp_mode_value, _temp_mode_road_id, _temp_mode_entered_intersection = compute_temp_destination_mode(
+                    world_map=world_map,
+                    carla=carla,
+                    ego_transform=ego_transform,
+                    mode_reference_xy=_prev_dest_xy,
+                    prev_mode=_prev_mode,
+                    prev_road_id=_prev_road_id,
+                    prev_entered_intersection=bool(_prev_entered_intersection),
+                    next_macro_maneuver=str(planning_next_maneuver),
+                    intersection_threshold_m=float(
+                        _behavior_runtime_value(
+                            behavior_runtime_cfg,
+                            rule_planner_cfg,
+                            key="intersection_distance_threshold_m",
+                            legacy_key="intersection_threshold_m",
+                            default=30.0,
                         )
                     ),
                 )
-            )
-            ego_snapshot = {
-                "x": float(ego_state[0]),
-                "y": float(ego_state[1]),
-                "v": float(ego_state[2]),
-                "psi": float(ego_state[3]),
-            }
-            base_destination_state = compute_temporary_destination_state(
-                ego_snapshot=ego_snapshot,
-                lane_center_waypoints=lane_center_waypoints,
-                target_lane_id=int(base_target_lane_id),
-                target_distance_m=float(rolling_target_distance_m),
-                target_v_mps=float(current_target_v_mps),
-                road_cfg=road_cfg,
-                next_maneuver=str(getattr(maneuver_route_summary, "next_macro_maneuver", "Continue Straight")),
-            )
-            if base_destination_state is None:
-                base_destination_state = list(final_destination_state)
-                base_destination_state[2] = float(current_target_v_mps)
-
-            if route_rebuild_due:
-                base_route_summary = global_planner.summarize_cached_route_progress(
-                    cached_route_summary=initial_global_route_summary,
-                    start_xy=list(base_destination_state[:2]),
-                    goal_xy=final_destination_state[:2],
+                temp_mode_str = (
+                    "INTERSECTION" if float(raw_temp_mode_value) > 0.5 else "NORMAL"
                 )
-
-            force_route_rebuild = False
-            if bool(behavior_runtime_cfg.get("enabled", False)):
-                with behavior_shared_lock:
-                    latest_decision_from_worker = behavior_shared_state.get("latest_decision", None)
+                intersection_front_obstacle = nearest_front_obstacles_by_lane.get(
+                    int(current_lane_id),
+                    None,
+                )
+                current_lane_safety = float(
+                    lane_scores.get(int(current_lane_id), 1.0)
+                )
+                intersection_obstacle_response = evaluate_intersection_obstacle_response(
+                    mode=str(temp_mode_str),
+                    front_obstacle_speed_mps=(
+                        None
+                        if intersection_front_obstacle is None
+                        else float(intersection_front_obstacle.get("v", 0.0))
+                    ),
+                    original_max_velocity_mps=float(original_max_velocity_mps),
+                    moving_obstacle_speed_threshold_mps=float(
+                        moving_obstacle_speed_threshold_mps
+                    ),
+                    route_lane_safety_score=float(current_lane_safety),
+                    static_obstacle_replan_lane_safety_threshold=float(
+                        static_obstacle_replan_lane_safety_threshold
+                    ),
+                )
+                static_obstacle_replan_requested = bool(
+                    _should_force_intersection_reroute(
+                        mode=str(temp_mode_str),
+                        ego_lane_id=int(current_lane_id),
+                        lane_safety_scores=lane_scores,
+                        nearest_front_obstacles_by_lane=nearest_front_obstacles_by_lane,
+                        safety_threshold=float(
+                            static_obstacle_replan_lane_safety_threshold
+                        ),
+                    )
+                )
                 if (
-                    isinstance(latest_decision_from_worker, BehaviorPlannerDecision)
-                    and str(latest_decision_from_worker.request_id) != str(last_applied_decision_id)
+                    static_obstacle_replan_requested
+                    and (
+                        float(sim_time_s) - float(last_static_intersection_replan_time_s)
+                    ) >= float(max(0.0, static_obstacle_replan_cooldown_s))
                 ):
-                    execution = apply_behavior_planner_decision(
-                        decision=latest_decision_from_worker,
-                        ego_snapshot={
-                            "x": float(ego_state[0]),
-                            "y": float(ego_state[1]),
-                            "v": float(ego_state[2]),
-                            "psi": float(ego_state[3]),
-                        },
-                        base_destination_state=base_destination_state,
-                        final_destination_state=final_destination_state,
-                        lane_center_waypoints=lane_center_waypoints,
-                        selected_lane_id=int(selected_lane_id),
-                        previous_applied_behavior=str(current_applied_behavior),
-                        road_cfg=road_cfg,
-                        local_goal_cfg=local_goal_cfg,
-                        mpc_constraints=mpc_constraints_cfg,
-                        target_distance_m=float(rolling_target_distance_m),
-                        next_maneuver=str(getattr(base_route_summary, "next_macro_maneuver", "Continue Straight")),
+                    print("global planner called , rerouting")
+                    replanned_route_summary, replanned_route_points = _replan_route_around_static_intersection_obstacle(
+                        global_planner=global_planner,
+                        ego_transform=ego_transform,
+                        goal_location=aligned_destination_transform.location,
+                        blocked_obstacle_snapshot=intersection_front_obstacle,
+                        blocked_lane_id=int(current_lane_id),
                     )
-                    latest_decision = latest_decision_from_worker
-                    last_applied_decision_id = str(latest_decision_from_worker.request_id)
-                    current_applied_behavior = str(execution.applied_behavior or current_applied_behavior)
-                    current_target_v_mps = float(execution.destination_state[2])
-                    current_max_velocity_override_mps = execution.max_velocity_override_mps
-                    force_route_rebuild = True
-                    selected_lane_id = _clamp_lane_id_to_allowed(
-                        int(execution.selected_lane_id),
-                        local_allowed_lane_ids,
+                    if replanned_route_summary is not None and len(replanned_route_points) > 0:
+                        active_global_route_points = list(replanned_route_points)
+                        last_static_intersection_replan_time_s = float(sim_time_s)
+                        current_route_summary = global_planner.get_current_route_info(
+                            x_m=float(ego_state[0]),
+                            y_m=float(ego_state[1]),
+                            query_key="ego",
+                        )
+                        planning_temporary_route_summary = current_route_summary
+                        if _prev_dest_xy is not None:
+                            planning_temporary_route_summary = global_planner.get_current_route_info(
+                                x_m=float(_prev_dest_xy[0]),
+                                y_m=float(_prev_dest_xy[1]),
+                                query_key="blue_dot",
+                            )
+                        planning_next_maneuver = normalize_macro_maneuver(
+                            getattr(planning_temporary_route_summary, "next_macro_maneuver", "straight")
+                        )
+                        planning_optimal_lane_id = _clamp_optional_lane_id_to_allowed(
+                            getattr(planning_temporary_route_summary, "optimal_lane_id", -1),
+                            local_allowed_lane_ids,
+                        )
+                        raw_temp_mode_value, _temp_mode_road_id, _temp_mode_entered_intersection = compute_temp_destination_mode(
+                            world_map=world_map,
+                            carla=carla,
+                            ego_transform=ego_transform,
+                            mode_reference_xy=_prev_dest_xy,
+                            prev_mode=_prev_mode,
+                            prev_road_id=_prev_road_id,
+                            prev_entered_intersection=bool(_prev_entered_intersection),
+                            next_macro_maneuver=str(planning_next_maneuver),
+                            intersection_threshold_m=float(
+                                _behavior_runtime_value(
+                                    behavior_runtime_cfg,
+                                    rule_planner_cfg,
+                                    key="intersection_distance_threshold_m",
+                                    legacy_key="intersection_threshold_m",
+                                    default=30.0,
+                                )
+                            ),
+                        )
+                        temp_mode_str = (
+                            "INTERSECTION" if float(raw_temp_mode_value) > 0.5 else "NORMAL"
+                        )
+
+                behavior_target_max_velocity_mps = float(
+                    intersection_obstacle_response.get(
+                        "speed_cap_mps",
+                        float(original_max_velocity_mps),
                     )
-
-            behavior_upper = str(current_applied_behavior).upper()
-            active_target_lane_id = _clamp_lane_id_to_allowed(
-                int(selected_lane_id),
-                local_allowed_lane_ids,
-            )
-
-            target_distance_for_destination_m = float(rolling_target_distance_m)
-            if behavior_upper == "EMERGENCY_BRAKE":
-                braking_mps2 = max(1e-6, abs(float(mpc_constraints_cfg.get("min_acceleration_mps2", -3.0))))
-                target_distance_for_destination_m = max(
-                    1.0,
-                    float(max(0.0, ego_state[2])) ** 2 / (2.0 * braking_mps2),
                 )
-            elif behavior_upper == "STOP":
-                target_distance_for_destination_m = max(
-                    1.0,
-                    min(
-                        float(road_cfg.get("distance_to_signal_m", 10000.0)),
-                        float(road_cfg.get("distance_to_intersection_m", 10000.0)),
+                current_target_v_mps = float(behavior_target_max_velocity_mps)
+
+                # ---- Rule-based behavior planner (synchronous) ------- #
+                planner_output = rule_planner.update(
+                    lane_safety_scores=lane_scores,
+                    ego_lane_id=int(current_lane_id),
+                    ego_lateral_offset_m=float(ego_offset_info.get("lateral_offset_m", 0.0)),
+                    ego_heading_error_rad=float(ego_offset_info.get("heading_error_rad", 0.0)),
+                    mode=str(temp_mode_str),
+                    route_optimal_lane_id=int(planning_optimal_lane_id),
+                    next_macro_maneuver=str(planning_next_maneuver),
+                    front_obstacle_distance_by_lane=front_obstacle_distance_by_lane,
+                )
+                current_applied_behavior = normalize_behavior_decision(
+                    planner_output.get("decision", "lane_follow")
+                )
+                selected_lane_id = _clamp_lane_id_to_allowed(
+                    int(planner_output.get("target_lane_id", current_lane_id)),
+                    local_allowed_lane_ids,
+                )
+                active_planning_maneuver = intersection_route_follow_maneuver(
+                    mode=str(temp_mode_str),
+                    next_macro_maneuver=str(planning_next_maneuver),
+                    decision=str(current_applied_behavior),
+                    target_lane_id=int(selected_lane_id),
+                    available_lane_ids=local_allowed_lane_ids,
+                    current_road_option=str(
+                        getattr(planning_temporary_route_summary, "current_road_option", "")
                     ),
                 )
 
-            if (
-                int(active_target_lane_id) == int(base_target_lane_id)
-                and abs(float(target_distance_for_destination_m) - float(rolling_target_distance_m)) <= 1e-6
-                and len(base_destination_state) >= 4
-            ):
-                temporary_destination_state = list(base_destination_state)
-            else:
-                temporary_destination_state = compute_temporary_destination_state(
-                    ego_snapshot=ego_snapshot,
-                    lane_center_waypoints=lane_center_waypoints,
-                    target_lane_id=int(active_target_lane_id),
-                    target_distance_m=float(target_distance_for_destination_m),
+                # ---- Temporary destination via CARLA waypoints ------- #
+                temporary_destination_state = compute_temp_destination(
+                    world_map=world_map,
+                    carla=carla,
+                    ego_transform=ego_transform,
+                    target_lane_id=int(selected_lane_id),
+                    decision=str(current_applied_behavior),
+                    lookahead_m=float(rolling_target_distance_m),
                     target_v_mps=float(current_target_v_mps),
-                    road_cfg=road_cfg,
-                    next_maneuver=str(getattr(base_route_summary, "next_macro_maneuver", "Continue Straight")),
+                    global_route_points=active_global_route_points,
+                    mode_reference_xy=_prev_dest_xy,
+                    prev_mode=_prev_mode,
+                    prev_road_id=_prev_road_id,
+                    prev_entered_intersection=bool(_prev_entered_intersection),
+                    next_macro_maneuver=str(active_planning_maneuver),
+                    mode_override=str(temp_mode_str),
                 )
-            if temporary_destination_state is None:
-                temporary_destination_state = list(base_destination_state)
-
-            if behavior_upper == "EMERGENCY_BRAKE":
-                temporary_destination_state[2] = 0.0
-            elif behavior_upper == "STOP":
-                temporary_destination_state[2] = 0.0
-
-            if route_rebuild_due or force_route_rebuild:
-                maneuver_route_summary = global_planner.summarize_cached_route_progress(
-                    cached_route_summary=initial_global_route_summary,
-                    start_xy=list(temporary_destination_state[:2]),
-                    goal_xy=final_destination_state[:2],
+                temporary_destination_state, active_plan_max_velocity_mps = _apply_final_destination_snap(
+                    temporary_destination_state=temporary_destination_state,
+                    final_destination_state=final_destination_state,
+                    ego_state=ego_state,
+                    lock_to_final_distance_m=float(
+                        local_goal_cfg.get("lock_to_final_distance_m", 5.0)
+                    ),
+                    original_max_velocity_mps=float(behavior_target_max_velocity_mps),
                 )
 
-            if bool(behavior_runtime_cfg.get("enabled", False)):
-                with behavior_shared_lock:
-                    behavior_shared_state["latest_inputs"] = {
-                        "ego_snapshot": {
-                            "x": float(ego_state[0]),
-                            "y": float(ego_state[1]),
-                            "v": float(ego_state[2]),
-                            "psi": float(ego_state[3]),
-                        },
-                        "destination_state": list(final_destination_state),
-                        "temporary_destination_state": list(temporary_destination_state),
-                        "object_snapshots": list(predicted_snapshots),
-                        "route_summary": maneuver_route_summary,
-                    }
-                    behavior_shared_state["current_applied_behavior"] = str(current_applied_behavior)
+                temporary_route_summary = planning_temporary_route_summary
+                if temporary_destination_state is not None and len(temporary_destination_state) >= 2:
+                    temporary_route_summary = global_planner.get_current_route_info(
+                        x_m=float(temporary_destination_state[0]),
+                        y_m=float(temporary_destination_state[1]),
+                        query_key="blue_dot",
+                    )
+                current_temp_mode_str = (
+                    "INTERSECTION"
+                    if (
+                        temporary_destination_state is not None
+                        and len(temporary_destination_state) >= 6
+                        and float(temporary_destination_state[5]) > 0.5
+                    )
+                    else "NORMAL"
+                )
+                current_temp_reference_xy = (
+                    (float(temporary_destination_state[0]), float(temporary_destination_state[1]))
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 2
+                    else _prev_dest_xy
+                )
+                current_temp_mode_value = (
+                    float(temporary_destination_state[5])
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 6
+                    else raw_temp_mode_value
+                )
+                current_temp_road_id = (
+                    int(temporary_destination_state[6])
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 7
+                    else _temp_mode_road_id
+                )
+                current_temp_entered_intersection = (
+                    float(temporary_destination_state[7]) > 0.5
+                    if temporary_destination_state is not None
+                    and len(temporary_destination_state) >= 8
+                    else bool(_temp_mode_entered_intersection)
+                )
+                reference_next_maneuver = normalize_macro_maneuver(
+                    getattr(temporary_route_summary, "next_macro_maneuver", planning_next_maneuver)
+                )
+                current_route_optimal_lane_id = _clamp_optional_lane_id_to_allowed(
+                    getattr(temporary_route_summary, "optimal_lane_id", -1),
+                    local_allowed_lane_ids,
+                )
+                display_reference_maneuver = str(reference_next_maneuver)
+                active_reference_maneuver = intersection_route_follow_maneuver(
+                    mode=str(current_temp_mode_str),
+                    next_macro_maneuver=str(reference_next_maneuver),
+                    decision=str(current_applied_behavior),
+                    target_lane_id=int(selected_lane_id),
+                    available_lane_ids=local_allowed_lane_ids,
+                    current_road_option=str(
+                        getattr(temporary_route_summary, "current_road_option", "")
+                    ),
+                )
 
-            if current_applied_behavior == "EMERGENCY_BRAKE":
-                if saved_max_velocity_before_emergency_mps is None:
-                    saved_max_velocity_before_emergency_mps = float(mpc.constraints.max_velocity_mps)
-                mpc.constraints.max_velocity_mps = 0.0
-            else:
-                if saved_max_velocity_before_emergency_mps is not None:
-                    mpc.constraints.max_velocity_mps = float(saved_max_velocity_before_emergency_mps)
-                    saved_max_velocity_before_emergency_mps = None
-                else:
-                    mpc.constraints.max_velocity_mps = float(original_max_velocity_mps)
-
-            if current_max_velocity_override_mps is not None:
-                mpc.constraints.max_velocity_mps = float(current_max_velocity_override_mps)
-
-            should_replan_mpc = (
-                last_mpc_replan_sim_time_s < 0.0
-                or (float(sim_time_s) - float(last_mpc_replan_sim_time_s)) >= float(mpc.trajectory_generation_period_s) - 1e-9
-            )
-            if should_replan_mpc:
+                # ---- MPC solve to the blue dot with path shaping ----- #
+                mpc.constraints.max_velocity_mps = float(active_plan_max_velocity_mps)
                 lane_reference_speed_mps = max(
                     1.0,
                     float(ego_state[2]),
                     abs(float(temporary_destination_state[2])) if len(temporary_destination_state) >= 3 else 0.0,
                 )
-                local_lane_center_reference = build_lane_center_reference_to_destination(
-                    ego_snapshot=ego_snapshot,
-                    lane_center_waypoints=lane_center_waypoints,
-                    destination_state=temporary_destination_state,
+                local_lane_center_reference = build_reference_samples(
+                    world_map=world_map,
+                    carla=carla,
+                    ego_transform=ego_transform,
+                    target_lane_id=int(selected_lane_id),
+                    decision=str(current_applied_behavior),
                     horizon_steps=int(mpc.horizon_steps),
                     step_distance_m=max(0.5, float(lane_reference_speed_mps) * float(mpc.dt_s)),
-                    target_distance_m=float(target_distance_for_destination_m),
-                    road_cfg=road_cfg,
-                    next_maneuver=str(getattr(base_route_summary, "next_macro_maneuver", "Continue Straight")),
+                    global_route_points=active_global_route_points,
+                    mode_reference_xy=current_temp_reference_xy,
+                    prev_mode=current_temp_mode_value,
+                    prev_road_id=current_temp_road_id,
+                    prev_entered_intersection=bool(current_temp_entered_intersection),
+                    next_macro_maneuver=str(active_reference_maneuver),
+                    mode_override=str(current_temp_mode_str),
                 )
                 new_planned_trajectory = mpc.plan_trajectory(
                     current_state=ego_state,
@@ -1581,17 +2328,27 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                     object_snapshots=predicted_snapshots,
                     current_acceleration_mps2=float(current_acceleration_mps2),
                     current_steering_rad=float(current_steering_rad),
-                    lane_center_waypoints=lane_center_waypoints,
+                    lane_center_waypoints=[],
                     lane_center_reference_samples=local_lane_center_reference,
                 )
                 new_control_sequence = getattr(mpc, "_last_u_solution", None)
-                last_mpc_replan_sim_time_s = float(sim_time_s)
+                mpc.mark_replanned(sim_time_s)
 
                 if new_planned_trajectory:
                     planned_trajectory = list(new_planned_trajectory)
                 if new_control_sequence is not None and len(new_control_sequence) > 0:
                     cached_control_sequence = np.asarray(new_control_sequence, dtype=float)
                     cached_control_step_idx = 0
+
+                # Cache obstacle contours and HUD lane for rendering
+                cached_obstacle_contours = _build_obstacle_field_contours(
+                    mpc=mpc,
+                    ego_state=ego_state,
+                    object_snapshots=predicted_snapshots,
+                )
+                if len(temporary_destination_state) >= 5:
+                    cached_hud_temp_lane_prompt = int(temporary_destination_state[4])
+            # --- End heavy planning block ---
 
             if not planned_trajectory:
                 ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
@@ -1612,62 +2369,41 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                 if cached_control_step_idx < int(len(cached_control_sequence) - 1):
                     cached_control_step_idx += 1
 
-            if display is not None and topdown_queue is not None:
+            if display is not None and topdown_queue is not None and chase_queue is not None:
+                render_tick_counter += 1
                 topdown_image = None
+                chase_image = None
                 try:
-                    topdown_image = topdown_queue.get(timeout=0.25)
+                    topdown_image = topdown_queue.get_nowait()
                 except queue.Empty:
                     pass
-                ego_line = "ego = [pending]"
-                lane_line = "lane = [pending]"
-                route_maneuver_code = prompt_builder._macro_maneuver_code(
-                    str(getattr(maneuver_route_summary, "next_macro_maneuver", "Continue Straight"))
-                )
-                default_route_line = f"route = [{route_maneuver_code},1000,G]"
-                route_line = str(default_route_line)
-                with behavior_shared_lock:
-                    latest_prompt_text = str(behavior_shared_state.get("latest_prompt", ""))
-                    ego_line = _latest_prompt_line(latest_prompt_text, "ego = [", "ego = [pending]")
-                    lane_line = _latest_prompt_line(latest_prompt_text, "lane = [", "lane = [pending]")
-                    route_line = _latest_route_line(latest_prompt_text)
-                if route_line == "route = [pending]":
-                    route_line = str(default_route_line)
+                try:
+                    chase_image = chase_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                if topdown_image is None and chase_image is None:
+                    continue
 
-                temp_lane_context = global_planner.get_local_lane_context(
-                    x_m=float(temporary_destination_state[0]),
-                    y_m=float(temporary_destination_state[1]),
-                    heading_rad=float(temporary_destination_state[3]) if len(temporary_destination_state) >= 4 else 0.0,
+                # ---- HUD text (rule-based planner info) -------------- #
+                # Safety scores as compact string
+                safety_str = " ".join(
+                    f"L{lid}={s:.2f}"
+                    for lid, s in sorted(lane_scores.items())
                 )
-                temp_lane_prompt = prompt_builder._prompt_lane_id(
-                    raw_lane_id=(
-                        int(temporary_destination_state[4])
-                        if len(temporary_destination_state) >= 5
-                        else int(temp_lane_context.get("lane_id", 1))
-                    ),
-                    lane_count=int(lane_count),
-                )
-                route_optimal_lane_id = int(getattr(maneuver_route_summary, "optimal_lane_id", 1))
-                route_optimal_lane_prompt = prompt_builder._prompt_lane_id(
-                    raw_lane_id=max(1, int(route_optimal_lane_id)),
-                    lane_count=int(lane_count),
-                )
+                # Mode from temp destination (6th element)
+                td_mode_str = "INTERSECTION" if (len(temporary_destination_state) >= 6 and float(temporary_destination_state[5]) > 0.5) else "NORMAL"
+
                 terminal_planned_velocity_mps = float("nan")
                 if planned_trajectory and len(planned_trajectory[-1]) >= 3:
                     terminal_planned_velocity_mps = float(planned_trajectory[-1][2])
-                lookahead_cmd_text = f"{int(round(float(rolling_target_distance_m)))} m"
                 hud_lines = [
-                    ego_line,
-                    lane_line,
-                    route_line,
-                    f"gp_route_opt={str(getattr(maneuver_route_summary, 'next_macro_maneuver', 'Continue Straight'))}",
-                    f"gp_opt_lane={int(route_optimal_lane_prompt)}",
-                    f"v={float(ego_state[2]):.2f} m/s",
-                    f"v_ref={float(temporary_destination_state[2]):.2f} m/s",
-                    f"v_max={float(mpc.constraints.max_velocity_mps):.2f} m/s",
-                    f"traj_v_end={float(terminal_planned_velocity_mps):.2f} m/s",
-                    f"temp_lane={int(temp_lane_prompt)}",
-                    f"lookahead={lookahead_cmd_text}",
-                    f"decision={str(current_applied_behavior)}",
+                    f"v={float(ego_state[2]):.2f}  v_ref={float(temporary_destination_state[2]):.2f}  v_max={float(mpc.constraints.max_velocity_mps):.2f} m/s",
+                    f"ego_lane={int(current_lane_id)}  sel_lane={int(selected_lane_id)}",
+                    f"safety: {safety_str}",
+                    f"mode={td_mode_str}  maneuver={str(display_reference_maneuver)}",
+                    f"route_opt_lane={int(current_route_optimal_lane_id)}",
+                    f"decision={str(current_applied_behavior)}  lc_state={rule_planner.lc_state}",
+                    f"traj_v_end={float(terminal_planned_velocity_mps):.2f}  lookahead={int(round(float(rolling_target_distance_m)))}m",
                 ]
                 topdown_overlay = None
                 if topdown_camera is not None:
@@ -1684,26 +2420,28 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                         "image_width_px": int(image_width_px),
                         "image_height_px": int(image_height_px),
                         "overlay_z_m": float(ego_vehicle.get_location().z),
-                        "global_route_points": list(initial_global_route_points or []),
+                        "global_route_points": _route_points_for_visualization(
+                            active_global_route_points,
+                            enabled=bool(global_route_visualization_enabled),
+                        ),
                         "temporary_destination_state": list(temporary_destination_state),
                         "planned_trajectory_states": list(planned_trajectory or []),
-                        "obstacle_field_contours": _build_obstacle_field_contours(
-                            mpc=mpc,
-                            ego_state=ego_state,
-                            object_snapshots=predicted_snapshots,
-                        ),
+                        "obstacle_field_contours": cached_obstacle_contours,
                     }
-                _render_topdown_camera(
+                _render_camera_pair(
                     display,
                     topdown_image,
+                    chase_image,
                     topdown_overlay=topdown_overlay,
                     hud_lines=hud_lines,
                     hud_font=hud_font,
                 )
     finally:
-        behavior_stop_event.set()
-        if behavior_thread is not None:
-            behavior_thread.join(timeout=1.0)
+        if traffic_manager is not None:
+            try:
+                traffic_manager.set_synchronous_mode(False)
+            except Exception:
+                pass
         world.apply_settings(previous_settings)
         _destroy_actors(actors_to_destroy)
         if pygame is not None:

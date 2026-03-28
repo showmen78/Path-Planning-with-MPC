@@ -1,0 +1,15 @@
+# Core numeric stack used by the MPC, tracker, and super-ellipsoid reference script.
+numpy
+scipy
+
+# QP solver used by the live MPC planner.
+osqp
+
+# YAML configuration loading.
+pyyaml
+
+# OpenAI API client used by the behavior-planner LLM loop.
+openai
+
+# Camera display window for CARLA scenario visualization.
+pygame

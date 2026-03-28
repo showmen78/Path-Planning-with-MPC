@@ -209,6 +209,18 @@ def wait_for_carla_server(carla, host: str, port: int, timeout_s: float) -> Any:
     )
 
 
+def _is_retriable_world_ready_error(exc: Exception) -> bool:
+    if isinstance(exc, RuntimeError):
+        return True
+    if isinstance(exc, ValueError):
+        error_text = str(exc).strip().lower()
+        if "integer overflow in color channel" in error_text:
+            return True
+        if "color channel" in error_text and "overflow" in error_text:
+            return True
+    return False
+
+
 def wait_for_carla_world_ready(client, world, timeout_s: float) -> Any:
     """
     Wait until the currently loaded world responds to the core API calls used
@@ -225,6 +237,8 @@ def wait_for_carla_world_ready(client, world, timeout_s: float) -> Any:
             current_world.get_blueprint_library()
             return current_world
         except Exception as exc:
+            if not _is_retriable_world_ready_error(exc):
+                raise
             last_error = exc
             time.sleep(1.0)
     raise RuntimeError(
@@ -254,11 +268,8 @@ def _build_map_load_candidates(map_name: str) -> list[str]:
     if normalized.startswith("/Game/"):
         folder_token = normalized.rstrip("/").split("/")[-1]
         parent_folder = normalized.rstrip("/").split("/")[-2] if "/" in normalized.rstrip("/") else folder_token
-        if folder_token == parent_folder:
+        if folder_token != parent_folder:
             add(f"{normalized.rstrip('/')}/{folder_token}")
-        else:
-            add(parent_folder)
-            add(f"{normalized.rstrip('/')}/{last_token}")
 
     return candidates
 
@@ -274,6 +285,13 @@ def _map_name_matches_requested(current_map_name: str, candidates: list[str]) ->
         if current_leaf == candidate_leaf:
             return True
     return False
+
+
+def _safe_world_map_name(world) -> str:
+    try:
+        return str(world.get_map().name)
+    except Exception:
+        return ""
 
 
 def run_carla_scenario(name: str) -> int:
@@ -308,8 +326,8 @@ def run_carla_scenario(name: str) -> int:
     world = None
     last_error: Exception | None = None
     current_world = client.get_world()
-    current_map_name = str(current_world.get_map().name)
-    if _map_name_matches_requested(current_map_name, load_candidates):
+    current_map_name = _safe_world_map_name(current_world)
+    if current_map_name and _map_name_matches_requested(current_map_name, load_candidates):
         world = current_world
         requested_map = current_map_name
     else:
@@ -336,10 +354,10 @@ def run_carla_scenario(name: str) -> int:
         timeout_s=max(10.0, float(request_timeout_s)),
     )
 
+    from carla_scenario.runner import CARLA_FIXED_DELTA_SECONDS
     settings = world.get_settings()
     settings.synchronous_mode = bool(carla_cfg.get("synchronous_mode", False))
-    fixed_delta_seconds = carla_cfg.get("fixed_delta_seconds")
-    settings.fixed_delta_seconds = float(fixed_delta_seconds) if fixed_delta_seconds is not None else None
+    settings.fixed_delta_seconds = CARLA_FIXED_DELTA_SECONDS
     world.apply_settings(settings)
 
     print(f"Loaded CARLA scenario: {scenario_cfg['name']}")

@@ -1,0 +1,34 @@
+After receiving the response from the behavior planner, the following changes will be made based on the selected behavior.
+target_v is the velocity retured by behavior planner
+
+RULES:
+
+DEFAULT VALUES:
+store_v_max= v_max
+v_ref = v_max
+
+
+inside behavior planner loop: 
+
+if v_max ==0: v_max = store_v_max
+
+
+
+if behavior == LANE_KEEP:
+    do nothing
+
+elif behavior == LANE_CHANGE_LEFT:
+    move the temporary_destination(blue dot) to the left lane (just like now)
+
+
+elif behavior == LANE_CHANGE_RIGHT:
+    move the temporary_destination (blue dot) to the right lane (just line now)
+
+
+elif behavior == STOP:
+    fix the temporary_destination at a waypoint in the same lane which is  dist_to_signal m away from the ego.
+    v_ref = 0
+
+elif behavior == EMERGENCY_BRAKE:
+    v_ref =0
+    v_max =0
