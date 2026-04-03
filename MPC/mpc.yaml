@@ -2,7 +2,7 @@ mpc:
   # Prediction horizon [s].
   # Increase -> planner can anticipate farther ahead, but the QP gets larger
   # and more expensive. Decrease -> faster solve, but shorter planning view.
-  horizon_s: 3.0
+  horizon_s: 2.0
 
   # MPC prediction discretization step [s].
   # Independent from CARLA simulation tick (fixed at 0.05s / 20 Hz).

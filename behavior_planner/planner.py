@@ -839,17 +839,11 @@ class RuleBasedBehaviorPlanner:
             except Exception:
                 signal_distance_m = None
 
-        release_for_green = (
-            str(normalized_signal_state) == "green"
-            and (
-                not bool(self._stop_latched)
-                or self._latched_signal_actor_id is None
-                or (
-                    bool(signal_found)
-                    and signal_actor_id == self._latched_signal_actor_id
-                )
-            )
-        )
+        # A green signal must always release the stop latch. Signal matching
+        # can be unstable across ticks near/inside junctions, and keeping a
+        # red latch alive after a confirmed green causes the planner to hold
+        # `stop` incorrectly.
+        release_for_green = str(normalized_signal_state) == "green"
         should_release_latch = bool(ego_in_junction) or bool(release_for_green)
         if should_release_latch:
             self._stop_latched = False

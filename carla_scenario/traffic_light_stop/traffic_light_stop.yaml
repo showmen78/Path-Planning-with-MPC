@@ -45,7 +45,7 @@ ego:
 
 constraints:
   min_velocity_mps: 0.0
-  max_velocity_mps: 7.0
+  max_velocity_mps: 10.0
   min_acceleration_mps2: -10.0
   max_acceleration_mps2: 3.0
   max_jerk_mps3: 10.0

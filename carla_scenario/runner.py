@@ -2029,6 +2029,7 @@ def run_loaded_world(client, world, scenario_cfg: Mapping[str, object], carla) -
                     ego_transform=tick_ego_transform,
                     global_route_points=active_global_route_points,
                     search_distance_m=float(traffic_light_stop_search_distance_m),
+                    query_key="ego",
                 )
                 tick_traffic_signal_context = find_relevant_signal_context(
                     world=world,

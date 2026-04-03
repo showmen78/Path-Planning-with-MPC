@@ -1,0 +1,137 @@
+Behavior Planner Algorithm
+
+1. Update route context.
+   Get the ego-route summary from the stored global route.
+   Get the blue-dot route summary from the previous blue-dot position.
+   Read:
+   - route_optimal_lane_id
+   - next_macro_maneuver
+   - current route mode candidate (NORMAL / INTERSECTION)
+
+2. Update perception and cooperative inputs.
+   Read dynamic obstacle snapshots.
+   Update obstacle tracker histories and predicted trajectories.
+   Update the tracked next-traffic-signal context:
+   - signal actor
+   - signal phase
+   - signal distance
+   - stop target before the junction
+   Read new cooperative lane-closure messages from cp_message.json.
+
+3. Build lane-level driving context.
+   Compute:
+   - ego_lane_id
+   - available_lane_ids
+   - lane_safety_scores
+   - nearest front obstacle per lane
+   - ego lateral offset and heading error
+
+4. Determine behavior-planner state.
+   Maintain:
+   - selected_lane_id
+   - target_lane_id
+   - lane_change_state
+   - stop_latched
+   - latched_stop_target
+   - blue_dot_rolling
+
+5. Decision priority.
+   Apply the following order every cycle:
+   - reroute
+   - traffic-signal stop
+   - continue ongoing lane change
+   - normal/intersection lane decision
+
+6. Reroute logic.
+   If a new lane-closure message affects the active route:
+   - clear any ongoing lane change
+   - request a global reroute with the existing reroute path
+   - keep the current selected lane for this cycle
+   - let the next cycle decide whether a lane change is needed on the new route
+
+7. Traffic-signal stop logic.
+   Use the tracked next-signal context and the stop target.
+   If the signal state is red, or yellow with feasible stopping distance:
+   - latch stop
+   - set decision = stop
+   - freeze the blue dot at the stop target
+   - set blue_dot_rolling = false
+   - set mode override = INTERSECTION
+   Keep the stop latched until:
+   - the relevant signal turns green, or
+   - the ego has entered/passed the junction
+
+8. Ongoing lane-change logic.
+   If lane_change_state is active:
+   - do not interrupt it
+   - keep issuing lane_change_left or lane_change_right
+   - complete only when:
+     - ego_lane_id == target_lane_id
+     - lateral offset is within threshold
+     - heading error is within threshold
+
+9. NORMAL mode lane logic.
+   Let selected_lane_id be the planner-owned blue-dot lane.
+
+   If route_optimal_lane_id is safe:
+   - if selected_lane_id == route_optimal_lane_id:
+     decision = lane_follow
+   - else:
+     decision = one-step lane change toward route_optimal_lane_id
+     only if the adjacent target lane exists and is safe
+     otherwise lane_follow in the current selected lane
+
+   If route_optimal_lane_id is unsafe:
+   - if selected_lane_id == route_optimal_lane_id:
+     choose the safest adjacent available lane
+     if it exists and is safe:
+       decision = one-step lane change to that lane
+     else:
+       decision = lane_follow
+   - if selected_lane_id != route_optimal_lane_id:
+     keep following the selected lane
+     if the selected lane also becomes unsafe and a safer adjacent lane exists:
+       decision = one-step lane change to that safer adjacent lane
+
+10. INTERSECTION mode lane logic.
+   In intersection mode the route-optimal lane has priority.
+
+   If selected_lane_id == route_optimal_lane_id:
+   - decision = lane_follow
+   - do not start safety-driven detours
+
+   If selected_lane_id != route_optimal_lane_id:
+   - decision = one-step lane change toward route_optimal_lane_id
+   - only if that adjacent lane exists and is safe
+   - otherwise lane_follow in the current selected lane
+
+11. Blue-dot ownership rules.
+   The blue dot never changes lane without an explicit behavior-planner lane-change decision.
+
+   If decision = lane_follow:
+   - if selected_lane_id == route_optimal_lane_id:
+     follow the global route
+   - else:
+     keep the blue dot on the selected lane while still using the global route
+     for longitudinal progress
+
+   If decision = lane_change_left or lane_change_right:
+   - move the blue dot to the adjacent target lane
+   - keep longitudinal progress anchored to the global route
+
+   If decision = stop:
+   - keep the blue dot at the stop target until the stop latch is released
+
+12. MPC interface.
+   Every cycle feed MPC:
+   - predicted obstacle trajectories / potential-field obstacles
+   - blue-dot state
+   - lane-center reference samples
+   - stop-goal flag when stop is active
+   - speed cap adjustments for moving intersection blockers
+
+13. Route-optimal-lane rule.
+   route_optimal_lane_id must be read with the same canonical lane-id convention
+   used everywhere else in the project.
+   It must describe the active lane of the stored global route at the blue-dot
+   progress position.

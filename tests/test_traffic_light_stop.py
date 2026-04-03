@@ -151,6 +151,58 @@ class TrafficLightStopTests(unittest.TestCase):
 
         self.assertIsNone(stop_target)
 
+    def test_find_stop_target_advances_to_next_junction_across_close_parallel_route_segments(self):
+        wp0 = _DummyWaypoint(x_m=0.0, y_m=0.0, road_id=30, section_id=0, lane_id=-1, is_junction=False)
+        wp1 = _DummyWaypoint(x_m=0.0, y_m=5.0, road_id=30, section_id=0, lane_id=-1, is_junction=False)
+        wp2 = _DummyWaypoint(x_m=0.0, y_m=10.0, road_id=31, section_id=0, lane_id=-1, is_junction=True)
+        wp3 = _DummyWaypoint(x_m=2.0, y_m=10.0, road_id=32, section_id=0, lane_id=-1, is_junction=False)
+        wp4 = _DummyWaypoint(x_m=2.0, y_m=5.0, road_id=32, section_id=0, lane_id=-1, is_junction=False)
+        wp5 = _DummyWaypoint(x_m=2.0, y_m=0.0, road_id=32, section_id=0, lane_id=-1, is_junction=False)
+        wp6 = _DummyWaypoint(x_m=2.0, y_m=-5.0, road_id=33, section_id=0, lane_id=-1, is_junction=True)
+        world_map = _NearestWaypointMap(wp0, wp1, wp2, wp3, wp4, wp5, wp6)
+        route_points = [
+            [0.0, 0.0],
+            [0.0, 5.0],
+            [0.0, 10.0],
+            [2.0, 10.0],
+            [2.0, 5.0],
+            [2.0, 0.0],
+            [2.0, -5.0],
+        ]
+
+        for ego_x_m, ego_y_m in (
+            (0.0, 0.0),
+            (0.0, 4.0),
+            (1.8, 9.0),
+        ):
+            _ = find_stop_target_from_ego(
+                world_map=world_map,
+                carla=_DummyCarla,
+                ego_transform=types.SimpleNamespace(
+                    location=types.SimpleNamespace(x=float(ego_x_m), y=float(ego_y_m), z=0.0)
+                ),
+                global_route_points=route_points,
+                search_distance_m=40.0,
+                query_key="test_parallel_progression",
+            )
+
+        stop_target = find_stop_target_from_ego(
+            world_map=world_map,
+            carla=_DummyCarla,
+            ego_transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=1.0, y=4.0, z=0.0)
+            ),
+            global_route_points=route_points,
+            search_distance_m=40.0,
+            query_key="test_parallel_progression",
+        )
+
+        self.assertIsNotNone(stop_target)
+        self.assertAlmostEqual(float(stop_target["x_m"]), 2.0, places=3)
+        self.assertAlmostEqual(float(stop_target["y_m"]), 0.0, places=3)
+        self.assertEqual(int(stop_target["road_id"]), 32)
+        self.assertAlmostEqual(float(stop_target["distance_m"]), 5.0, places=3)
+
     def test_should_stop_for_signal_stops_on_yellow_only_when_feasible(self):
         stop_target = {"distance_m": 15.0}
         self.assertTrue(
@@ -246,7 +298,7 @@ class TrafficLightStopTests(unittest.TestCase):
         )
         self.assertEqual(third_result["decision"], "lane_follow")
 
-    def test_behavior_planner_does_not_release_red_latch_for_different_green_signal(self):
+    def test_behavior_planner_releases_red_latch_for_green_signal_even_if_actor_changes(self):
         planner = RuleBasedBehaviorPlanner()
         stop_target = {
             "x_m": 0.0,
@@ -295,9 +347,9 @@ class TrafficLightStopTests(unittest.TestCase):
             ego_max_deceleration_mps2=2.0,
             ego_in_junction=False,
         )
-        self.assertEqual(second_result["decision"], "stop")
-        self.assertTrue(bool(second_result["traffic_light_debug"]["stop_latched"]))
-        self.assertFalse(bool(second_result["blue_dot_rolling"]))
+        self.assertNotEqual(second_result["decision"], "stop")
+        self.assertFalse(bool(second_result["traffic_light_debug"]["stop_latched"]))
+        self.assertFalse(bool(second_result["traffic_light_debug"]["stop_decision_active"]))
 
     def test_find_relevant_signal_context_selects_signal_by_stop_waypoint_match(self):
         stop_target = {"x_m": 0.0, "y_m": 12.0, "distance_m": 12.0}
@@ -388,6 +440,63 @@ class TrafficLightStopTests(unittest.TestCase):
         self.assertEqual(int(signal_context["signal_actor_id"]), 101)
         self.assertEqual(str(signal_context["signal_state"]), "red")
         self.assertEqual(str(signal_context["signal_source"]), "stop_waypoint_match")
+
+    def test_find_relevant_signal_context_uses_lane_aware_stop_waypoint_match_for_later_signal(self):
+        stop_target = {
+            "x_m": 0.0,
+            "y_m": 12.0,
+            "distance_m": 25.0,
+            "lane_id": 1,
+            "road_id": 20,
+            "section_id": 1,
+        }
+        correct_far_wp = _DummyWaypoint(
+            x_m=0.0,
+            y_m=30.0,
+            road_id=20,
+            section_id=1,
+            lane_id=-1,
+            is_junction=False,
+        )
+        wrong_near_wp = _DummyWaypoint(
+            x_m=0.0,
+            y_m=12.5,
+            road_id=21,
+            section_id=0,
+            lane_id=-1,
+            is_junction=False,
+        )
+        correct_signal = _FakeTrafficLightActor(
+            actor_id=301,
+            name="signal_later_correct",
+            state="Red",
+            x_m=5.0,
+            y_m=30.0,
+            stop_waypoints=[correct_far_wp],
+        )
+        wrong_signal = _FakeTrafficLightActor(
+            actor_id=302,
+            name="signal_wrong_nearby",
+            state="Green",
+            x_m=2.0,
+            y_m=12.0,
+            stop_waypoints=[wrong_near_wp],
+        )
+
+        signal_context = find_relevant_signal_context(
+            world=_FakeWorld([wrong_signal, correct_signal]),
+            ego_vehicle=_FakeEgoVehicle(),
+            ego_transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+            ),
+            stop_target=stop_target,
+        )
+
+        self.assertTrue(bool(signal_context["signal_found"]))
+        self.assertEqual(int(signal_context["signal_actor_id"]), 301)
+        self.assertEqual(str(signal_context["signal_state"]), "red")
+        self.assertEqual(str(signal_context["signal_source"]), "stop_waypoint_match")
+        self.assertAlmostEqual(float(signal_context["signal_distance_m"]), 25.0, places=3)
 
     def test_behavior_planner_outputs_signal_debug_when_not_stopping(self):
         planner = RuleBasedBehaviorPlanner()

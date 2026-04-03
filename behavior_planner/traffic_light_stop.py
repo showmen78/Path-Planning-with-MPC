@@ -9,16 +9,21 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 from utility.carla_lane_graph import canonical_lane_id_for_waypoint
 
+_STOP_TARGET_QUERY_STATE: Dict[str, tuple[tuple[object, ...], float, float, float]] = {}
+
 
 def normalize_signal_state(signal_state: object) -> str:
-    raw_name = str(signal_state or "").strip().upper()
+    # Do NOT use `signal_state or ""` — carla.TrafficLightState.Red has integer
+    # value 0, which is falsy in Python, so `Red or ""` evaluates to "" and the
+    # state is misidentified as "unknown".  Use an explicit None check instead.
+    raw_name = (str(signal_state) if signal_state is not None else "").strip().upper()
     if "." in raw_name:
         raw_name = raw_name.rsplit(".", 1)[-1]
-    if raw_name in {"GREEN"}:
+    if raw_name in {"GREEN", "GO"}:
         return "green"
     if raw_name in {"YELLOW", "AMBER"}:
         return "yellow"
-    if raw_name in {"RED"}:
+    if raw_name in {"RED", "STOP"}:
         return "red"
     return "unknown"
 
@@ -49,8 +54,44 @@ def _traffic_light_actor_name(actor: Any) -> str:
 
 
 def _iter_world_traffic_lights(world) -> Iterable[Any]:
-    for actor in list(world.get_actors() if hasattr(world, "get_actors") else []):
-        if callable(getattr(actor, "get_state", None)):
+    """Yield only real traffic-light actors from the CARLA world.
+
+    The old filter ``callable(getattr(actor, "get_state", None))`` matched any
+    actor that exposes ``get_state()``.  In some CARLA versions vehicles,
+    walkers, or traffic signs also expose this method and their states do not
+    normalize to red/green/yellow → the wrong actor could win the candidate
+    selection and report state="unknown".
+
+    Strategy (in order):
+    1. Use ``ActorList.filter("traffic.traffic_light*")`` — the cleanest CARLA
+       API call.
+    2. Fall back to iterating all actors and checking ``type_id``.
+    Both paths additionally verify that ``get_state()`` is callable so the rest
+    of the caller logic is unchanged.
+    """
+    get_actors_fn = getattr(world, "get_actors", None)
+    if not callable(get_actors_fn):
+        return
+    try:
+        all_actors = get_actors_fn()
+    except Exception:
+        return
+
+    # Strategy 1: use CARLA's built-in pattern filter (most reliable)
+    filter_fn = getattr(all_actors, "filter", None)
+    if callable(filter_fn):
+        try:
+            for actor in filter_fn("traffic.traffic_light*"):
+                if callable(getattr(actor, "get_state", None)):
+                    yield actor
+            return
+        except Exception:
+            pass
+
+    # Strategy 2: fallback — iterate all actors and match by type_id string
+    for actor in list(all_actors):
+        type_id = str(getattr(actor, "type_id", "")).lower()
+        if "traffic_light" in type_id and callable(getattr(actor, "get_state", None)):
             yield actor
 
 
@@ -90,6 +131,115 @@ def _signal_distance_from_actor(
     )
 
 
+def _route_sample_hint_m(cum_dists: Sequence[float]) -> float:
+    if len(cum_dists) < 2:
+        return 2.0
+    segment_lengths = [
+        max(0.0, float(cum_dists[index + 1]) - float(cum_dists[index]))
+        for index in range(len(cum_dists) - 1)
+    ]
+    positive_lengths = [
+        float(length_m)
+        for length_m in segment_lengths
+        if float(length_m) > 1.0e-3
+    ]
+    if len(positive_lengths) == 0:
+        return 2.0
+    positive_lengths.sort()
+    middle_index = len(positive_lengths) // 2
+    if len(positive_lengths) % 2 == 1:
+        median_length_m = float(positive_lengths[middle_index])
+    else:
+        median_length_m = 0.5 * float(
+            positive_lengths[middle_index - 1] + positive_lengths[middle_index]
+        )
+    return max(1.0, min(10.0, float(median_length_m)))
+
+
+def _route_signature_key(
+    route_points: Sequence[Sequence[float]],
+    cum_dists: Sequence[float],
+) -> tuple[object, ...]:
+    if len(route_points) == 0:
+        return (0,)
+    head_points = tuple(
+        (
+            round(float(point[0]), 3),
+            round(float(point[1]), 3),
+        )
+        for point in list(route_points[:3])
+    )
+    tail_points = tuple(
+        (
+            round(float(point[0]), 3),
+            round(float(point[1]), 3),
+        )
+        for point in list(route_points[-3:])
+    )
+    total_length_m = float(cum_dists[-1]) if len(cum_dists) > 0 else 0.0
+    return (
+        int(len(route_points)),
+        head_points,
+        tail_points,
+        round(float(total_length_m), 3),
+    )
+
+
+def _clear_stop_target_query_state(query_key: str | None) -> None:
+    cache_key = str(query_key or "").strip()
+    if cache_key:
+        _STOP_TARGET_QUERY_STATE.pop(cache_key, None)
+
+
+def _stop_target_match_details(
+    *,
+    stop_waypoint: Any,
+    stop_target_xy: tuple[float, float],
+    stop_target_lane_id: int | None,
+    stop_target_road_id: int | None,
+    stop_target_section_id: int | None,
+) -> tuple[int, float] | None:
+    stop_location = getattr(
+        getattr(stop_waypoint, "transform", None),
+        "location",
+        None,
+    )
+    if stop_location is None:
+        return None
+
+    match_distance_m = float(
+        math.hypot(
+            float(stop_location.x) - float(stop_target_xy[0]),
+            float(stop_location.y) - float(stop_target_xy[1]),
+        )
+    )
+    stop_waypoint_road_id = int(getattr(stop_waypoint, "road_id", 0))
+    stop_waypoint_section_id = int(getattr(stop_waypoint, "section_id", 0))
+    stop_waypoint_lane_id = int(canonical_lane_id_for_waypoint(stop_waypoint))
+
+    road_matches = (
+        stop_target_road_id is not None
+        and int(stop_waypoint_road_id) == int(stop_target_road_id)
+    )
+    section_matches = (
+        stop_target_section_id is not None
+        and int(stop_waypoint_section_id) == int(stop_target_section_id)
+    )
+    lane_matches = (
+        stop_target_lane_id is not None
+        and int(stop_target_lane_id) != 0
+        and int(stop_waypoint_lane_id) == int(stop_target_lane_id)
+    )
+
+    if road_matches and section_matches and lane_matches:
+        return 0, float(match_distance_m)
+    if road_matches and lane_matches:
+        return 1, float(match_distance_m)
+    if road_matches and section_matches:
+        return 2, float(match_distance_m)
+    return 3, float(match_distance_m)
+
+
 def find_relevant_signal_context(
     *,
     world,
@@ -110,6 +260,7 @@ def find_relevant_signal_context(
     }
 
     ego_associated_actor = None
+    ego_associated_state: str | None = None  # state read via dedicated vehicle API
     get_traffic_light_fn = getattr(ego_vehicle, "get_traffic_light", None)
     if callable(get_traffic_light_fn):
         try:
@@ -117,8 +268,22 @@ def find_relevant_signal_context(
         except Exception:
             ego_associated_actor = None
 
+    # When ego IS inside a trigger zone, use get_traffic_light_state() as the
+    # authoritative state source.  This avoids the general get_state() path on
+    # the actor object which can fail or be ambiguous.
+    if ego_associated_actor is not None:
+        get_tl_state_fn = getattr(ego_vehicle, "get_traffic_light_state", None)
+        if callable(get_tl_state_fn):
+            try:
+                ego_associated_state = normalize_signal_state(get_tl_state_fn())
+            except Exception:
+                ego_associated_state = None
+
     stop_target_xy = None
     stop_target_distance_m = None
+    stop_target_lane_id = None
+    stop_target_road_id = None
+    stop_target_section_id = None
     if isinstance(stop_target, Mapping):
         try:
             stop_target_xy = (
@@ -129,30 +294,61 @@ def find_relevant_signal_context(
                 0.0,
                 float(stop_target.get("distance_m", 0.0)),
             )
+            raw_stop_target_lane_id = stop_target.get("lane_id", None)
+            raw_stop_target_road_id = stop_target.get("road_id", None)
+            raw_stop_target_section_id = stop_target.get("section_id", None)
+            stop_target_lane_id = (
+                None
+                if raw_stop_target_lane_id is None
+                else int(raw_stop_target_lane_id)
+            )
+            stop_target_road_id = (
+                None
+                if raw_stop_target_road_id is None
+                else int(raw_stop_target_road_id)
+            )
+            stop_target_section_id = (
+                None
+                if raw_stop_target_section_id is None
+                else int(raw_stop_target_section_id)
+            )
         except Exception:
             stop_target_xy = None
             stop_target_distance_m = None
+            stop_target_lane_id = None
+            stop_target_road_id = None
+            stop_target_section_id = None
 
     candidate_actors: list[Any] = []
-    seen_candidate_ids: set[int] = set()
+    # Deduplicate by CARLA actor ID (integer), not Python id() (memory address).
+    # Each call to world.get_actors() may return new Python wrapper objects for
+    # the same underlying CARLA actor, so id() differs even for the same light.
+    seen_candidate_actor_ids: set[object] = set()
     for candidate_actor in [ego_associated_actor, *_iter_world_traffic_lights(world)]:
         if candidate_actor is None:
             continue
-        candidate_id = id(candidate_actor)
-        if candidate_id in seen_candidate_ids:
+        # Prefer CARLA's own integer actor ID; fall back to Python object id.
+        carla_actor_id = getattr(candidate_actor, "id", None)
+        dedup_key = carla_actor_id if carla_actor_id is not None else id(candidate_actor)
+        if dedup_key in seen_candidate_actor_ids:
             continue
-        seen_candidate_ids.add(candidate_id)
+        seen_candidate_actor_ids.add(dedup_key)
         candidate_actors.append(candidate_actor)
 
     best_candidate: Dict[str, object] | None = None
     for candidate_actor in candidate_actors:
-        candidate_state = "unknown"
-        get_state_fn = getattr(candidate_actor, "get_state", None)
-        if callable(get_state_fn):
-            try:
-                candidate_state = normalize_signal_state(get_state_fn())
-            except Exception:
-                candidate_state = "unknown"
+        # When this is the ego-associated actor, prefer the state read directly
+        # via get_traffic_light_state() (more reliable) over get_state().
+        if candidate_actor is ego_associated_actor and ego_associated_state is not None:
+            candidate_state = str(ego_associated_state)
+        else:
+            candidate_state = "unknown"
+            get_state_fn = getattr(candidate_actor, "get_state", None)
+            if callable(get_state_fn):
+                try:
+                    candidate_state = normalize_signal_state(get_state_fn())
+                except Exception:
+                    candidate_state = "unknown"
 
         actor_name = _traffic_light_actor_name(candidate_actor)
         signal_distance_m = _signal_distance_from_actor(
@@ -161,27 +357,28 @@ def find_relevant_signal_context(
         )
         match_distance_m = float("inf")
         signal_source = "actor_position_match"
+        stop_waypoint_match_rank = None
 
         if stop_target_xy is not None:
             stop_waypoints = _traffic_light_stop_waypoints(candidate_actor)
             if len(stop_waypoints) > 0:
-                waypoint_distances = []
+                waypoint_match_details = []
                 for stop_waypoint in stop_waypoints:
-                    stop_location = getattr(
-                        getattr(stop_waypoint, "transform", None),
-                        "location",
-                        None,
+                    match_details = _stop_target_match_details(
+                        stop_waypoint=stop_waypoint,
+                        stop_target_xy=stop_target_xy,
+                        stop_target_lane_id=stop_target_lane_id,
+                        stop_target_road_id=stop_target_road_id,
+                        stop_target_section_id=stop_target_section_id,
                     )
-                    if stop_location is None:
+                    if match_details is None:
                         continue
-                    waypoint_distances.append(
-                        math.hypot(
-                            float(stop_location.x) - float(stop_target_xy[0]),
-                            float(stop_location.y) - float(stop_target_xy[1]),
-                        )
+                    waypoint_match_details.append(match_details)
+                if len(waypoint_match_details) > 0:
+                    stop_waypoint_match_rank, match_distance_m = min(
+                        waypoint_match_details,
+                        key=lambda item: (int(item[0]), float(item[1])),
                     )
-                if len(waypoint_distances) > 0:
-                    match_distance_m = min(float(distance) for distance in waypoint_distances)
                     signal_source = "stop_waypoint_match"
             if not math.isfinite(match_distance_m):
                 actor_transform = _actor_transform(candidate_actor)
@@ -204,7 +401,21 @@ def find_relevant_signal_context(
                 match_distance_m = float(stop_target_distance_m)
 
         if signal_source == "stop_waypoint_match":
-            if float(match_distance_m) > float(max_stop_waypoint_match_distance_m):
+            lane_aware_max_match_distance_m = max(
+                float(max_stop_waypoint_match_distance_m),
+                35.0,
+            )
+            section_aware_max_match_distance_m = max(
+                float(max_stop_waypoint_match_distance_m),
+                20.0,
+            )
+            if stop_waypoint_match_rank in {0, 1}:
+                if float(match_distance_m) > float(lane_aware_max_match_distance_m):
+                    continue
+            elif stop_waypoint_match_rank == 2:
+                if float(match_distance_m) > float(section_aware_max_match_distance_m):
+                    continue
+            elif float(match_distance_m) > float(max_stop_waypoint_match_distance_m):
                 continue
         elif signal_source == "actor_position_match":
             if float(match_distance_m) > float(max_actor_position_match_distance_m):
@@ -224,6 +435,7 @@ def find_relevant_signal_context(
             "signal_match_distance_m": (
                 None if not math.isfinite(match_distance_m) else float(match_distance_m)
             ),
+            "signal_match_rank": stop_waypoint_match_rank,
             "signal_actor": candidate_actor,
         }
         if best_candidate is None:
@@ -237,11 +449,17 @@ def find_relevant_signal_context(
         }
         current_priority = (
             int(source_priority.get(str(candidate_context["signal_source"]), 9)),
+            9
+            if candidate_context.get("signal_match_rank", None) is None
+            else int(candidate_context.get("signal_match_rank", 9)),
             float(candidate_context.get("signal_match_distance_m") or float("inf")),
             float(candidate_context.get("signal_distance_m") or float("inf")),
         )
         best_priority = (
             int(source_priority.get(str(best_candidate["signal_source"]), 9)),
+            9
+            if best_candidate.get("signal_match_rank", None) is None
+            else int(best_candidate.get("signal_match_rank", 9)),
             float(best_candidate.get("signal_match_distance_m") or float("inf")),
             float(best_candidate.get("signal_distance_m") or float("inf")),
         )
@@ -251,6 +469,7 @@ def find_relevant_signal_context(
     if best_candidate is None:
         return dict(default_context)
     best_candidate.pop("signal_actor", None)
+    best_candidate.pop("signal_match_rank", None)
     return best_candidate
 
 
@@ -276,12 +495,14 @@ def _project_to_route_arc(
     y_m: float,
     route_points: Sequence[Sequence[float]],
     cum_dists: Sequence[float],
+    query_key: str | None = None,
 ) -> float:
     if len(route_points) < 2:
+        _clear_stop_target_query_state(query_key)
         return 0.0
 
-    best_dist_sq = float("inf")
-    best_arc_m = 0.0
+    best_distance_m = float("inf")
+    candidates: list[tuple[float, float]] = []
     for idx in range(len(route_points) - 1):
         ax_m = float(route_points[idx][0])
         ay_m = float(route_points[idx][1])
@@ -300,14 +521,83 @@ def _project_to_route_arc(
             alpha = max(0.0, min(1.0, float(alpha)))
         proj_x_m = float(ax_m) + float(alpha) * float(dx_m)
         proj_y_m = float(ay_m) + float(alpha) * float(dy_m)
-        dist_sq = (
-            (float(x_m) - float(proj_x_m)) ** 2
-            + (float(y_m) - float(proj_y_m)) ** 2
+        distance_m = float(
+            math.hypot(
+                float(x_m) - float(proj_x_m),
+                float(y_m) - float(proj_y_m),
+            )
         )
-        if dist_sq < best_dist_sq:
-            best_dist_sq = float(dist_sq)
-            best_arc_m = float(cum_dists[idx]) + float(alpha) * float(math.sqrt(max(segment_len_sq, 0.0)))
-    return float(best_arc_m)
+        progress_m = float(cum_dists[idx]) + float(alpha) * float(
+            math.sqrt(max(segment_len_sq, 0.0))
+        )
+        best_distance_m = min(float(best_distance_m), float(distance_m))
+        candidates.append((float(distance_m), float(progress_m)))
+
+    if len(candidates) == 0:
+        _clear_stop_target_query_state(query_key)
+        return 0.0
+
+    sample_hint_m = _route_sample_hint_m(cum_dists)
+    ambiguity_margin_m = max(1.0, 0.75 * float(sample_hint_m))
+    plausible_candidates = [
+        candidate
+        for candidate in candidates
+        if float(candidate[0]) <= float(best_distance_m) + float(ambiguity_margin_m)
+    ]
+    selected_candidates = plausible_candidates if len(plausible_candidates) > 0 else candidates
+    selected_candidate = min(
+        selected_candidates,
+        key=lambda candidate: (float(candidate[1]), float(candidate[0])),
+    )
+
+    cache_key = str(query_key or "").strip()
+    if cache_key:
+        route_key = _route_signature_key(route_points, cum_dists)
+        previous_state = _STOP_TARGET_QUERY_STATE.get(cache_key, None)
+        if previous_state is not None:
+            previous_route_key, previous_progress_m, previous_x_m, previous_y_m = previous_state
+            if previous_route_key == route_key:
+                movement_m = float(
+                    math.hypot(
+                        float(x_m) - float(previous_x_m),
+                        float(y_m) - float(previous_y_m),
+                    )
+                )
+                progress_backtrack_m = max(2.0, 2.0 * float(sample_hint_m))
+                progress_advance_m = max(
+                    8.0,
+                    float(movement_m) + 6.0 * float(sample_hint_m),
+                )
+                preferred_progress_m = float(previous_progress_m) + min(
+                    max(float(movement_m), float(sample_hint_m)),
+                    float(progress_advance_m),
+                )
+                continuity_candidates = [
+                    candidate
+                    for candidate in selected_candidates
+                    if (
+                        float(previous_progress_m) - float(progress_backtrack_m)
+                        <= float(candidate[1])
+                        <= float(previous_progress_m) + float(progress_advance_m)
+                    )
+                ]
+                if len(continuity_candidates) > 0:
+                    selected_candidate = min(
+                        continuity_candidates,
+                        key=lambda candidate: (
+                            abs(float(candidate[1]) - float(preferred_progress_m)),
+                            float(candidate[0]),
+                            float(candidate[1]),
+                        ),
+                    )
+        _STOP_TARGET_QUERY_STATE[cache_key] = (
+            route_key,
+            float(selected_candidate[1]),
+            float(x_m),
+            float(y_m),
+        )
+
+    return float(selected_candidate[1])
 
 
 def find_stop_target_from_ego(
@@ -317,6 +607,7 @@ def find_stop_target_from_ego(
     ego_transform,
     global_route_points: Sequence[Sequence[float]],
     search_distance_m: float = 100.0,
+    query_key: str | None = None,
 ) -> Dict[str, float] | None:
     route_points = [
         [float(point[0]), float(point[1])]
@@ -324,10 +615,12 @@ def find_stop_target_from_ego(
         if isinstance(point, Sequence) and len(point) >= 2
     ]
     if len(route_points) < 2:
+        _clear_stop_target_query_state(query_key)
         return None
 
     ego_location = getattr(ego_transform, "location", None)
     if ego_location is None:
+        _clear_stop_target_query_state(query_key)
         return None
     ego_x_m = float(getattr(ego_location, "x", 0.0))
     ego_y_m = float(getattr(ego_location, "y", 0.0))
@@ -341,6 +634,7 @@ def find_stop_target_from_ego(
         y_m=float(ego_y_m),
         route_points=route_points,
         cum_dists=route_cum_dists,
+        query_key=query_key,
     )
     max_search_distance_m = max(0.0, float(search_distance_m))
 
