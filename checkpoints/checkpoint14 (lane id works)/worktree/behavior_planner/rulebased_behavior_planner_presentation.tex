@@ -1,0 +1,207 @@
+\documentclass{beamer}
+\usetheme{Madrid}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\title{Current Rule-Based Behavior Planner}
+\subtitle{Lane Safety and Lane Selection Logic}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Planner Role}
+  \begin{itemize}
+    \item The rule-based planner runs inside the main loop and selects the behavior:
+    \[
+      \texttt{lane\_follow}, \quad \texttt{lane\_change\_left}, \quad \texttt{lane\_change\_right}
+    \]
+    \item Main inputs:
+    \begin{itemize}
+      \item lane safety scores \(S_{\text{lane}}\)
+      \item ego lane id
+      \item route-optimal lane id from the global planner
+      \item front-obstacle distance in each lane
+      \item ego lateral offset and heading error
+      \item driving mode: NORMAL or INTERSECTION
+    \end{itemize}
+    \item Main output: target lane for the blue-dot / local reference generator.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Obstacle Classification in Ego Frame}
+  For each obstacle, the planner computes longitudinal position in the ego frame:
+  \[
+    s = \cos(\psi_e)(x_o - x_e) + \sin(\psi_e)(y_o - y_e)
+  \]
+  \begin{itemize}
+    \item \(s \ge 0\): obstacle is in front of ego
+    \item \(s < 0\): obstacle is behind ego
+    \item For each lane, only the nearest front and nearest rear obstacle are used.
+  \end{itemize}
+
+  \vspace{0.5em}
+  Variables:
+  \begin{itemize}
+    \item \((x_e, y_e, \psi_e)\): ego position and heading
+    \item \((x_o, y_o)\): obstacle position
+    \item \(s\): obstacle longitudinal distance relative to ego
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Lane Safety Score}
+  The obstacle-level score is built from distance, TTC, and TTC trend:
+  \[
+    \phi_d = \frac{\max(d - d_{\text{safe}}, 0)}{\max(d - d_{\text{safe}}, 0) + d_{\text{safe}}}
+  \]
+  \[
+    \phi_{\text{ttc}} = \frac{\max(\text{TTC} - \text{TTC}_{\text{safe}}, 0)}{\max(\text{TTC} - \text{TTC}_{\text{safe}}, 0) + \text{TTC}_{\text{safe}}}
+  \]
+  \[
+    \phi_m = \frac{1}{1 + e^{-k m}}
+  \]
+  \[
+    S_{\text{obs}} = \phi_d \, \phi_{\text{ttc}} \, \phi_m
+  \]
+
+  Hard safety constraint:
+  \[
+    d < d_{\text{safe}} \quad \text{or} \quad \text{TTC} < \text{TTC}_{\text{safe}}
+    \Longrightarrow
+    S_{\text{obs}} = 0
+  \]
+\end{frame}
+
+\begin{frame}{TTC and TTC Trend}
+  TTC is computed from closing speed:
+  \[
+    \text{TTC} =
+    \begin{cases}
+      \dfrac{d}{\max(\varepsilon, \Delta v)}, & \Delta v > 0 \\
+      \infty, & \Delta v \le 0
+    \end{cases}
+  \]
+
+  \vspace{0.5em}
+  The TTC trend is the linear-regression slope:
+  \[
+    m = \frac{\sum_i (t_i - \bar{t})(\text{TTC}_i - \overline{\text{TTC}})}
+             {\sum_i (t_i - \bar{t})^2}
+  \]
+
+  \begin{itemize}
+    \item \(d\): front or rear longitudinal distance
+    \item \(\Delta v\): closing speed
+    \item \(m > 0\): TTC is growing, so the situation is becoming safer
+    \item \(m < 0\): TTC is shrinking, so risk is increasing
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Lane Score}
+  For each lane, the planner evaluates:
+  \[
+    S_{\text{front}} = \text{score of nearest front obstacle}
+  \]
+  \[
+    S_{\text{rear}} = \text{score of nearest rear obstacle}
+  \]
+  \[
+    S_{\text{lane}} = \min(S_{\text{front}}, S_{\text{rear}})
+  \]
+
+  \begin{itemize}
+    \item If a lane has no relevant obstacle, its score defaults to \(1.0\).
+    \item The \(\min(\cdot)\) operator makes the lane conservative:
+    one dangerous front or rear interaction can make the whole lane unsafe.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Normal-Mode Decision Logic}
+  \textbf{Goal:} stay on the global route unless a blockage forces a detour.
+
+  \begin{enumerate}
+    \item Choose the route-optimal lane \(L_r\).
+    \item If ego is already in \(L_r\):
+    \begin{itemize}
+      \item keep following \(L_r\) when it is safe
+      \item if there is a front obstacle ahead in \(L_r\), move to an adjacent safe lane
+    \end{itemize}
+    \item If ego is on a temporary detour lane:
+    \begin{itemize}
+      \item return to \(L_r\) once \(L_r\) becomes safe again
+      \item otherwise continue in the temporary lane
+    \end{itemize}
+  \end{enumerate}
+
+  Lane change is allowed only if target-lane safety is above a threshold:
+  \[
+    S_{\text{target}} > S_{\text{threshold}}
+  \]
+\end{frame}
+
+\begin{frame}{Intersection-Mode Decision Logic}
+  \textbf{Goal:} let the global route dominate inside intersections.
+
+  \begin{itemize}
+    \item The desired lane is the route-optimal lane.
+    \item No safety-based lane preference override is used to change the route.
+    \item If a lane change is needed, only one lane step is allowed per decision.
+    \item A lane change is started only if the immediate target lane is safe enough:
+    \[
+      S_{\text{target}} > S_{\text{threshold}}
+    \]
+  \end{itemize}
+
+  This keeps the blue dot aligned with the global route while still enforcing a
+  minimum safety check before lateral motion.
+\end{frame}
+
+\begin{frame}{Lane-Change State Machine}
+  States:
+  \[
+    \texttt{IDLE}, \quad \texttt{CHANGING\_LEFT}, \quad \texttt{CHANGING\_RIGHT}
+  \]
+
+  Once a lane change starts, it is not interrupted until completion.
+
+  Completion conditions:
+  \[
+    \text{ego lane} = \text{target lane}
+  \]
+  \[
+    |e_y| \le e_{y,\max}
+    \quad \text{and} \quad
+    |e_\psi| \le e_{\psi,\max}
+  \]
+
+  \begin{itemize}
+    \item \(e_y\): lateral offset from lane center
+    \item \(e_\psi\): heading error relative to lane direction
+    \item \(e_{y,\max}\), \(e_{\psi,\max}\): lane-change completion thresholds
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Key Parameters and Interpretation}
+  Important planner parameters:
+  \begin{itemize}
+    \item \(d_{\text{safe}}\): minimum acceptable longitudinal gap
+    \item \(\text{TTC}_{\text{safe}}\): minimum acceptable time-to-collision
+    \item \(k\): gain in the TTC-slope sigmoid
+    \item \(S_{\text{threshold}}\): minimum target-lane safety for lane change
+    \item \(\Delta_{\text{hyst}}\): hysteresis margin before leaving current lane
+  \end{itemize}
+
+  \vspace{0.5em}
+  Summary:
+  \begin{itemize}
+    \item lane safety converts obstacle interactions into a score in \([0,1]\)
+    \item the behavior planner is route-first, not safety-score-only
+    \item lane changes are conservative, one-step, and threshold-gated
+  \end{itemize}
+\end{frame}
+
+\end{document}

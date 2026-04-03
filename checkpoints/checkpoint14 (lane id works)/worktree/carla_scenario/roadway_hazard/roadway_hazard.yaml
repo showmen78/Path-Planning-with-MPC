@@ -1,0 +1,85 @@
+name: roadway_hazard
+runner_module: carla_scenario.runner
+
+carla:
+  host: 127.0.0.1
+  port: 2000
+  timeout_s: 30.0
+  synchronous_mode: true
+  launch_if_needed: true
+  launch_timeout_s: 120.0
+  carla_root: /home/umd-user/carla_source/carla
+  launch_mode: ue4editor_map
+  rhi: -vulkan
+  launch_extra_args:
+    - "-quality-level=Low"
+    - "-ResX=800"
+    - "-ResY=600"
+  map: /Game/Carla/Maps/Town10HD_Opt
+
+anchors:
+  ego_spawn: cav_spawn
+  final_destination: final_destination
+
+traffic_manager:
+  enabled: true
+  port: 8000
+  synchronous_mode: true
+
+obstacles:
+  spawner_module: carla_scenario.roadway_hazard.scenario
+  marker_names:
+    - obstacle1
+    - obstacle2
+    - obstacle3
+    - obstacle4
+    - obstacle5
+    - obstacle6
+  autopilot_marker_names:
+    - obstacle6
+  vehicle_blueprint: vehicle.tesla.model3
+  color_rgb: "90,90,90"
+  spawn_z_offset_m: 0.05
+
+runtime:
+  module: carla_scenario.roadway_hazard.scenario
+  hidden_obstacle_id: obstacle4
+  relay_obstacle_id: obstacle6
+  reveal_distance_m: 20.0
+
+ego:
+  blueprint: vehicle.tesla.model3
+  role_name: ego
+  color_rgb: "255,0,0"
+  spawn_z_offset_m: 1.0
+
+constraints:
+  min_velocity_mps: 0.0
+  max_velocity_mps: 0.0
+  min_acceleration_mps2: -10.0
+  max_acceleration_mps2: 3.0
+  max_jerk_mps3: 10.0
+  min_steer_rad: -0.6
+  max_steer_rad: 0.6
+  min_steer_rate_rps: -0.4
+  max_steer_rate_rps: 0.4
+  enforce_terminal_velocity_constraint: true
+  terminal_velocity_mps: 0.0
+
+planning:
+  waypoint_sample_distance_m: 3.0
+  prompt_period_s: 1.0
+
+camera:
+  enabled: true
+  image_size_x: 840
+  image_size_y: 680
+  fov: 90.0
+  topdown:
+    world_fixed: false
+    height: 70.0
+    padding_m: 20.0
+  chase:
+    back: 8.0
+    height: 2.8
+    pitch: -10.0
